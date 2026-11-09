@@ -6,6 +6,7 @@ import std/regex::{Regex}
 import std/time::{Time}
 import loser/store
 import loser/projects
+import loser/task
 import loser/testkit
 import github.com/tuntii/kilim/kilim/testing::*
 
@@ -15,6 +16,18 @@ def seed(name : String) : String
   root
 end
 
+def mk(st : Loser::Store::Store, key : String, title : String, notes : String, status : String, labels : Array(String), now : Time) : Loser::Task::Task
+  r = st.create(key, title, notes, status, labels, now)
+  raise "create failed: " + r.to_s if r.is_a?(String)
+  r
+end
+
+def mp(st : Loser::Store::Store, name : String, repo : String?) : Loser::Projects::Project
+  r = st.add_project(name, repo)
+  raise "add_project failed: " + r.to_s if r.is_a?(String)
+  r
+end
+
 def main : Int32
   now = Time.utc(2026, 11, 9, 10, 0, 0)
 
@@ -22,9 +35,9 @@ def main : Int32
   root = seed("store_main")
   st = Loser::Store::Store.new(root)
   st.load
-  a = st.create("kilim", "Zeta", "", "done", [] of String, now)
-  b = st.create("kilim", "Alpha", "notes about çağ", "todo", [] of String, now)
-  c = st.create("kilim", "Mid", "", "doing", ["x"], now)
+  a = mk(st, "kilim", "Zeta", "", "done", [] of String, now)
+  b = mk(st, "kilim", "Alpha", "notes about çağ", "todo", [] of String, now)
+  c = mk(st, "kilim", "Mid", "", "doing", ["x"], now)
   [a, b, c].each { |t| expect(!(/^kilim-20261109100000[a-z]{3}$/ =~ t.id).nil?, "id shape " + t.id) }
   expect(a.id != b.id && b.id != c.id && a.id != c.id, "ids distinct")
   expect_eq(a.updated, "2026-11-09T10:00:00Z", "updated stamp")
@@ -56,7 +69,7 @@ def main : Int32
   expect(st2.find(a.id).nil?, "local delete forgets")
 
   # GitHub task: delete hides
-  g = st.create("kilim", "From GitHub", "", "todo", [] of String, now)
+  g = mk(st, "kilim", "From GitHub", "", "todo", [] of String, now)
   g.github = "Tuntii/kilim#12"
   st.save(g, now)
   st.delete(g)
@@ -90,7 +103,7 @@ def main : Int32
   expect_eq(s4.errors.join(","), "kilim/bad.md", "only bad.md is an error")
   expect_eq(s4.tasks("kilim").size, 0, "conflict and tmp ignored")
   expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by load")
-  other = s4.create("kilim", "Other", "", "todo", [] of String, now)
+  other = mk(s4, "kilim", "Other", "", "todo", [] of String, now)
   s4.save(other, now)
   expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by save")
 
@@ -98,12 +111,12 @@ def main : Int32
   r3 = Loser::Testkit.temp_root("store_addproject")
   s5 = Loser::Store::Store.new(r3)
   s5.load
-  assert_panics { s5.add_project("loser", "x") }
+  expect(s5.add_project("loser", "x").is_a?(String), "invalid repo is an error value")
   expect(!File.exists?(r3 + "/projects.toml"), "invalid repo writes nothing")
-  np = s5.add_project("Loser", "Tuntii/loser")
+  np = mp(s5, "Loser", "Tuntii/loser")
   expect_eq(np.key, "loser", "derived key")
   expect(File.read(r3 + "/projects.toml").includes?("key = \"loser\""), "projects.toml written")
-  expect_eq(s5.add_project("Loser", nil).key, "loser-2", "key avoids a taken one")
+  expect_eq(mp(s5, "Loser", nil).key, "loser-2", "key avoids a taken one")
 
   # broken projects.toml: reported, never overwritten
   r4 = Loser::Testkit.temp_root("store_badtoml")
@@ -112,7 +125,8 @@ def main : Int32
   s6.load
   expect_eq(s6.projects.size, 0, "no projects from a broken file")
   expect(s6.errors.size == 1 && s6.errors[0].starts_with?("projects.toml: "), "toml error named")
-  assert_panics { s6.add_project("A", nil) }
+  expect(!s6.projects_writable?, "broken toml is not writable")
+  expect(s6.add_project("A", nil).is_a?(String), "broken toml refuses add_project")
   expect_eq(File.read(r4 + "/projects.toml"), "[[project\nkey = ", "broken projects.toml untouched")
 
   # keys from the file are validated
@@ -124,6 +138,83 @@ def main : Int32
   expect(s7.errors.includes?("projects.toml: invalid key \"../x\""), "invalid key named")
   expect(s7.errors.includes?("projects.toml: duplicate key \"ok\""), "duplicate key named")
   expect(s7.errors.includes?("projects.toml: invalid key \"-no\""), "leading dash invalid")
+
+  # a skipped entry makes projects.toml read-only for loser
+  expect(!s7.projects_writable?, "skipped keys make it unwritable")
+  expect(s7.add_project("New", nil).is_a?(String), "add_project refuses after skipped keys")
+  r6 = Loser::Testkit.temp_root("store_noname")
+  toml6 = "[[project]]\nkey = \"ok\"\nname = \"Ok\"\n# mine\n[[project]]\nkey = \"nameless\"\n"
+  File.write(r6 + "/projects.toml", toml6)
+  s8 = Loser::Store::Store.new(r6)
+  s8.load
+  expect(!s8.projects_writable?, "entry without name makes it unwritable")
+  expect(s8.errors.includes?("projects.toml: entry without key or name"), "entry without name named")
+  expect(s8.add_project("New", nil).is_a?(String), "add_project refuses with a nameless entry")
+  expect_eq(File.read(r6 + "/projects.toml"), toml6, "hand-written projects.toml untouched")
+  expect(s5.projects_writable?, "clean file is writable")
+
+  # errors as values
+  expect(st.create("nope", "T", "", "todo", [] of String, now).is_a?(String), "create in an unknown project")
+  expect(st.create("kilim", "  ", "", "todo", [] of String, now).is_a?(String), "create with an empty title")
+  expect(s5.add_project("   ", nil).is_a?(String), "add_project with an empty name")
+
+  # a forgotten task: save puts it back, delete of an unknown task does nothing
+  r7 = seed("store_forgotten")
+  s9 = Loser::Store::Store.new(r7)
+  s9.load
+  ft = mk(s9, "kilim", "Forgotten", "text", "todo", [] of String, now)
+  fp = s9.path_of(ft)
+  File.delete(fp)
+  expect(s9.reload_file(fp).nil?, "reload of a vanished file")
+  expect(s9.find(ft.id).nil?, "vanished task forgotten")
+  expect(s9.save(ft, now).nil?, "save of a forgotten task works")
+  expect(File.exists?(fp), "file is back")
+  expect(!s9.find(ft.id).nil?, "task is known again")
+  ghost = Loser::Task::Task.new("zzz-1", "No project")
+  expect(s9.save(ghost, now).is_a?(String), "save without a project is an error value")
+  s9.delete(Loser::Task::Task.new("kilim-ghost", "Ghost"))
+  s9.delete(ghost)
+
+  # reload_file: new file, broken file, spelling of the root
+  nf = Loser::Task::Task.new("kilim-hand", "By hand")
+  File.write(r7 + "/kilim/kilim-hand.md", Loser::Task.render_task(nf))
+  got = s9.reload_file(r7 + "/kilim/kilim-hand.md") || raise("new file")
+  expect_eq(got.title, "By hand", "new file read")
+  expect(!s9.find("kilim-hand").nil?, "new file known")
+  expect(s9.mtime(r7 + "/kilim/kilim-hand.md") == Loser::Store.mtime_ns(r7 + "/kilim/kilim-hand.md"), "new file mtime")
+  expect(s9.reload_file(r7 + "/kilim/kilim-hand.conflict-2.md").nil?, "conflict file ignored")
+  expect(s9.reload_file(r7 + "/other/x.md").nil?, "unknown project folder ignored")
+  expect(s9.reload_file(r7 + "/../x.md").nil?, "outside the root ignored")
+  File.write(r7 + "/kilim/kilim-hand.md", "oops, no front matter")
+  expect(s9.reload_file(r7 + "/kilim/kilim-hand.md").nil?, "broken file gives nil")
+  expect(s9.find("kilim-hand").nil?, "broken file forgotten")
+  expect(s9.errors.includes?("kilim/kilim-hand.md"), "broken file named")
+  expect_eq(File.read(r7 + "/kilim/kilim-hand.md"), "oops, no front matter", "broken file untouched")
+  File.write(r7 + "/kilim/kilim-hand.md", Loser::Task.render_task(nf))
+  expect(!s9.reload_file(r7 + "/kilim/kilim-hand.md").nil?, "fixed file read again")
+  expect(!s9.errors.includes?("kilim/kilim-hand.md"), "error cleared")
+
+  s10 = Loser::Store::Store.new(r7 + "/")
+  s10.load
+  expect(!s10.find("kilim-hand").nil?, "trailing slash root loads")
+  expect(!s10.reload_file(r7 + "/kilim/kilim-hand.md").nil?, "trailing slash root reloads")
+  expect(s10.mtime(r7 + "/kilim/kilim-hand.md") != nil, "trailing slash root mtime")
+  if r7.includes?(":")
+    back = r7.gsub("/", "\\")
+    s11 = Loser::Store::Store.new(back)
+    s11.load
+    expect(!s11.reload_file(back + "\\kilim\\kilim-hand.md").nil?, "backslash root reloads")
+    expect(!s11.reload_file(r7.sub(r7[0, 1], r7[0, 1].upcase) + "/kilim/kilim-hand.md").nil?, "drive letter case")
+    expect(!s11.reload_file(r7.sub(r7[0, 1], r7[0, 1].downcase) + "/kilim/kilim-hand.md").nil?, "drive letter lower case")
+  end
+
+  # same title: ordered by id
+  r8 = seed("store_ties")
+  s12 = Loser::Store::Store.new(r8)
+  s12.load
+  t1 = mk(s12, "kilim", "Same", "", "todo", [] of String, now)
+  t2 = mk(s12, "kilim", "Same", "", "todo", [] of String, now)
+  expect_eq(s12.tasks("kilim").map { |t| t.id }.join(","), [t1.id, t2.id].sorted.join(","), "tie broken by id")
   0
 end
 
