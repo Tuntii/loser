@@ -1,0 +1,187 @@
+module test/changes_test
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/time::{Time}
+import loser/store
+import loser/projects
+import loser/changes
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def main : Int32
+  # merge
+  m = Loser::Changes.merge("t", "a", "t", "a b", "t", "a")
+  expect_eq(m.notes, "a b", "outside equals base keeps mine")
+  expect(!m.conflict, "no conflict 1")
+  m = Loser::Changes.merge("t", "a", "t", "a mine", "t", "a\nfrom mcp")
+  expect_eq(m.notes, "a mine\nfrom mcp", "append")
+  expect(!m.conflict, "no conflict 2")
+  m = Loser::Changes.merge("t", "a", "t", "a", "t", "x")
+  expect_eq(m.notes, "x", "outside edit")
+  expect(!m.conflict, "no conflict 3")
+  m = Loser::Changes.merge("t", "a", "t", "mine", "t", "theirs")
+  expect_eq(m.notes, "mine", "both edited")
+  expect(m.conflict, "conflict")
+  m = Loser::Changes.merge("t", "a", "t", "a b", "T2", "a")
+  expect_eq(m.title, "T2", "title from outside")
+  expect_eq(m.notes, "a b", "notes mine")
+  expect(!m.conflict, "no conflict 4")
+  m = Loser::Changes.merge("t", "a", "mine", "a", "theirs", "a")
+  expect_eq(m.title, "mine", "both edited title")
+  expect(m.conflict, "title conflict")
+  m = Loser::Changes.merge("t", "a", "t", "a", "t", "a")
+  expect(!m.conflict, "nothing changed")
+
+  # scan: 200 files in two projects
+  root = Loser::Testkit.temp_root("changes_scan")
+  Loser::Projects.save_projects(root, [Loser::Projects::Project.new("aa", "Aa"), Loser::Projects::Project.new("bb", "Bb")])
+  ids = [] of String
+  st = Loser::Store::Store.new(root)
+  st.load
+  100.times do |i|
+    ["aa", "bb"].each do |k|
+      r = st.create(k, "T" + i.to_s, "n", "todo", [] of String, Time.utc(2026, 11, 9, 10, i // 60, i % 60))
+      raise "create" if r.is_a?(String)
+      ids << st.path_of(r)
+    end
+  end
+  File.write(root + "/aa/x.conflict-1.md", "x")
+  File.write(root + "/aa/y.md.tmp", "x")
+  File.write(root + "/stray.md", "x")
+  t0 = Time.monotonic
+  out = Loser::Changes.scan(root)
+  ms = (Time.monotonic - t0).total_milliseconds
+  puts "scan of 200 files: " + ms.to_s + " ms"
+  expect(ms < 2000.0, "scan under 2 s")
+  lines = out.split("\n").reject { |l| l.empty? }
+  expect_eq(lines.size, 201, "200 tasks + projects.toml")
+  expect(!out.includes?("conflict"), "no conflict file")
+  expect(!out.includes?(".tmp"), "no tmp")
+  expect(!out.includes?("stray"), "no stray")
+  expect_eq(lines[0].split("\t").size, 3, "path, mtime, size")
+
+  # changed_paths
+  st2 = Loser::Store::Store.new(root)
+  st2.load
+  expect_eq(Loser::Changes.changed_paths(st2, Loser::Changes.scan(root)).size, 0, "nothing changed after load")
+  p1 = ids[0]
+  p2 = ids[1]
+  p3 = ids[2]
+  File.write(p1, File.read(p1) + "more")
+  expect_eq(Loser::Changes.changed_paths(st2, Loser::Changes.scan(root)), [st2.canon(p1) || ""], "rewritten file, size changed")
+  File.delete(p2)
+  ch = Loser::Changes.changed_paths(st2, Loser::Changes.scan(root))
+  expect_eq(ch.size, 2, "rewritten + deleted")
+  expect(ch.includes?(st2.canon(p2) || ""), "deleted listed")
+  st2.reload_file(p1)
+  st2.reload_file(p2)
+  expect_eq(Loser::Changes.changed_paths(st2, Loser::Changes.scan(root)).size, 0, "reloaded, quiet")
+  # our own save is not a change
+  all = st2.tasks("bb")
+  st2.save(all[0])
+  expect_eq(Loser::Changes.changed_paths(st2, Loser::Changes.scan(root)).size, 0, "own save is quiet")
+  # new file
+  File.write(root + "/aa/new.md", "---\nid: aa-new\ntitle: N\nstatus: todo\n---\n")
+  ch = Loser::Changes.changed_paths(st2, Loser::Changes.scan(root))
+  expect_eq(ch, [st2.root + "/aa/new.md"], "new file")
+  # file in a folder that is not a project
+  File.write(root + "/stray.md", "x")
+  Dir.mkdir_p(root + "/nope")
+  File.write(root + "/nope/a.md", "x")
+  ch = Loser::Changes.changed_paths(st2, Loser::Changes.scan(root))
+  expect_eq(ch.size, 1, "non-project folder ignored")
+  # projects.toml edited from outside
+  st2.reload_file(root + "/aa/new.md")
+  File.write(root + "/projects.toml", File.read(root + "/projects.toml") + "\n")
+  ch = Loser::Changes.changed_paths(st2, Loser::Changes.scan(root))
+  expect_eq(ch, [st2.root + "/projects.toml"], "projects.toml change")
+
+  # same second, same length: the known blind spot is only closed after a second passes
+  root2 = Loser::Testkit.temp_root("changes_same")
+  Loser::Projects.save_projects(root2, [Loser::Projects::Project.new("aa", "Aa")])
+  st3 = Loser::Store::Store.new(root2)
+  st3.load
+  r = st3.create("aa", "T", "abc", "todo", [] of String, Time.utc(2026, 11, 9, 10, 0, 0))
+  raise "create" if r.is_a?(String)
+  path = st3.path_of(r)
+  sleep 1100
+  File.write(path, File.read(path).sub("abc", "xyz"))
+  expect_eq(Loser::Changes.changed_paths(st3, Loser::Changes.scan(root2)), [st3.canon(path) || ""], "same length, a second later")
+
+  # write_conflict
+  res = Loser::Changes.write_conflict(st3, "outside text", r.id, Time.utc(2026, 11, 9, 10, 1, 2))
+  expect_eq(res, st3.root + "/aa/" + r.id + ".conflict-20261109100102.md", "conflict path")
+  expect_eq(File.read(root2 + "/aa/" + r.id + ".conflict-20261109100102.md"), "outside text", "conflict text")
+  expect_eq(Loser::Changes.changed_paths(st3, Loser::Changes.scan(root2)).size, 1, "conflict file never listed (only the edit)")
+
+  # merge: more branches
+  m = Loser::Changes.merge("a", "x", "a", "x b", "a", "x b")
+  expect_eq(m.notes, "x b", "same edit on both sides is not duplicated")
+  expect(!m.conflict, "same edit, no conflict")
+  m = Loser::Changes.merge("t", "a", "t", "a b", "t", "a b")
+  expect_eq(m.notes, "a b", "spec example, same append")
+  m = Loser::Changes.merge("t", "a", "mine", "a", "t", "a\nfrom mcp")
+  expect_eq(m.title, "mine", "local title kept")
+  expect_eq(m.notes, "a\nfrom mcp", "outside append taken")
+  expect(!m.conflict, "title local, notes outside")
+  m = Loser::Changes.merge("t", "abc", "t", "abc d", "t", "ab")
+  expect_eq(m.notes, "abc d", "outside shorter than base: mine wins")
+  expect(m.conflict, "shorter outside is a conflict")
+  m = Loser::Changes.merge("t", "", "t", "mine", "t", "theirs")
+  expect(m.conflict && m.notes == "mine", "empty base, both wrote")
+  m = Loser::Changes.merge("t", "", "t", "", "t", "theirs")
+  expect(!m.conflict && m.notes == "theirs", "empty base, outside wrote")
+  m = Loser::Changes.merge("t", "", "t", "mine", "t", "")
+  expect(!m.conflict && m.notes == "mine", "empty base, only mine")
+
+  # a broken task file is reported once, then quiet, then again after a rewrite
+  root3 = Loser::Testkit.temp_root("changes_broken")
+  Loser::Projects.save_projects(root3, [Loser::Projects::Project.new("aa", "Aa")])
+  Dir.mkdir_p(root3 + "/aa")
+  File.write(root3 + "/aa/bad.md", "not a task")
+  st4 = Loser::Store::Store.new(root3)
+  st4.load
+  bad = st4.root + "/aa/bad.md"
+  expect_eq(st4.errors.size, 1, "bad file is an error")
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)).size, 0, "broken file quiet after load")
+  sleep 1100
+  File.write(bad, "still not a task, longer")
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)), [bad], "broken file reported after rewrite")
+  st4.reload_file(bad)
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)).size, 0, "broken file quiet after reload")
+  File.delete(bad)
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)), [bad], "broken file deleted")
+  st4.reload_file(bad)
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)).size, 0, "deleted broken file settles")
+  expect_eq(st4.errors.size, 0, "error gone with the file")
+
+  # projects.toml: reported once, reload settles it
+  toml = st4.root + "/projects.toml"
+  File.write(root3 + "/projects.toml", File.read(toml) + "\n[[project]]\nkey = \"cc\"\nname = \"Cc\"\n")
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)), [toml], "projects.toml edited")
+  st4.reload_file(toml)
+  expect_eq(st4.projects.size, 2, "new project loaded")
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)).size, 0, "projects.toml quiet after reload")
+  File.write(root3 + "/projects.toml", "[[project\n")
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)), [toml], "broken projects.toml reported")
+  st4.reload_file(toml)
+  expect(!st4.projects_writable?, "broken toml is not writable")
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)).size, 0, "broken projects.toml quiet after reload")
+  File.delete(toml)
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)), [toml], "deleted projects.toml reported")
+  st4.reload_file(toml)
+  expect_eq(Loser::Changes.changed_paths(st4, Loser::Changes.scan(st4.root)).size, 0, "deleted projects.toml settles")
+  expect_eq(st4.projects.size, 0, "no projects after delete")
+
+  # conflict files never overwrite one another
+  res2 = Loser::Changes.write_conflict(st3, "second", r.id, Time.utc(2026, 11, 9, 10, 1, 2))
+  expect_eq(res2, st3.root + "/aa/" + r.id + ".conflict-20261109100102-2.md", "second conflict, same second")
+  res3 = Loser::Changes.write_conflict(st3, "third", r.id, Time.utc(2026, 11, 9, 10, 1, 2))
+  expect_eq(res3, st3.root + "/aa/" + r.id + ".conflict-20261109100102-3.md", "third conflict")
+  expect_eq(File.read(res.to_s), "outside text", "first conflict intact")
+  expect(Loser::Changes.scan(root2).includes?(st3.root + "/projects.toml"), "scan prints the store root form")
+  0
+end
+
+exit main

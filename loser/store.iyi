@@ -19,6 +19,13 @@ pub def mtime_ns(path : String) : Int64?
   info.modification_time * 1000000000_i64
 end
 
+# What a file looks like right now: {mtime ns, size in bytes}; nil when it is missing.
+# shortcut: a write in the same second with the same size looks like no change; upgrade when std grows sub-second times.
+pub def file_stamp(path : String) : {Int64, Int64}?
+  info = File.info?(path) || return nil
+  {info.modification_time * 1000000000_i64, info.size}
+end
+
 def valid_key?(k : String) : Bool
   return false if k.empty?
   k.chars.each_with_index do |c, i|
@@ -28,12 +35,12 @@ def valid_key?(k : String) : Bool
   true
 end
 
-def ignored_file?(name : String) : Bool
+pub def ignored_file?(name : String) : Bool
   !name.ends_with?(".md") || name.includes?(".conflict-")
 end
 
 # Forward slashes, no trailing slash.
-def clean_path(p : String) : String
+pub def clean_path(p : String) : String
   s = p.gsub("\\", "/")
   while s.bytesize > 1 && s.ends_with?("/")
     s = s.chomp("/")
@@ -62,16 +69,20 @@ end
 pub class Store
   getter root : String
   getter projects : Array(Project)
-  getter errors : Array(String)
+  # projects.toml problems first, then task files that could not be read.
+  pub def errors : Array(String)
+    @project_errors + @file_errors
+  end
 
   def initialize(@root : String)
     @root = clean_path(File.expand_path(clean_path(@root)))
     @projects = [] of Project
-    @errors = [] of String
+    @project_errors = [] of String
+    @file_errors = [] of String
     @tasks = [] of Task
     @keys = Hash(String, String).new   # task id -> project key
     @paths = Hash(String, String).new  # task id -> file path
-    @mtimes = Hash(String, Int64).new
+    @stamps = Hash(String, {Int64, Int64}).new
     @projects_broken = false
   end
 
@@ -82,24 +93,37 @@ pub class Store
 
   # Projects, then every <key>/*.md that is not *.conflict-*.md.
   pub def load : Nil
-    @projects = [] of Project
-    @errors = [] of String
+    @file_errors = [] of String
     @tasks = [] of Task
     @keys = Hash(String, String).new
     @paths = Hash(String, String).new
-    @mtimes = Hash(String, Int64).new
+    @stamps = Hash(String, {Int64, Int64}).new
+    reload_projects
+    @projects.each { |p| read_folder(p.key) }
+  end
+
+  # projects.toml again, by the rules of load; its stamp is refreshed.
+  def reload_projects : Nil
+    @projects = [] of Project
+    @project_errors = [] of String
     @projects_broken = false
+    toml = @root + "/projects.toml"
+    if st = file_stamp(toml)   # before the read
+      @stamps[toml] = st
+    else
+      @stamps.delete(toml)
+    end
     loaded = load_projects(@root)
     if loaded.is_a?(String)
       @projects_broken = true
-      @errors << loaded
+      @project_errors << loaded
     else
       loaded.each do |p|
         if !valid_key?(p.key)
-          @errors << "projects.toml: invalid key " + p.key.inspect
+          @project_errors << "projects.toml: invalid key " + p.key.inspect
           @projects_broken = true
         elsif @projects.any? { |q| q.key == p.key }
-          @errors << "projects.toml: duplicate key " + p.key.inspect
+          @project_errors << "projects.toml: duplicate key " + p.key.inspect
           @projects_broken = true
         else
           @projects << p
@@ -107,17 +131,18 @@ pub class Store
       end
       # load_projects skips entries without key or name silently; saving would drop them.
       if entry_count(@root) > loaded.size
-        @errors << "projects.toml: entry without key or name"
+        @project_errors << "projects.toml: entry without key or name"
         @projects_broken = true
       end
     end
-    @projects.each do |p|
-      dir = @root + "/" + p.key
-      next unless Dir.exists?(dir)
-      Dir.children(dir).sorted.each do |name|
-        next if ignored_file?(name)
-        read_into(p.key, dir + "/" + name)
-      end
+  end
+
+  def read_folder(key : String) : Nil
+    dir = @root + "/" + key
+    return unless Dir.exists?(dir)
+    Dir.children(dir).sorted.each do |name|
+      next if ignored_file?(name)
+      read_into(key, dir + "/" + name)
     end
   end
 
@@ -237,6 +262,7 @@ pub class Store
     list = @projects.dup
     list << p
     save_projects(@root, list)
+    remember(@root + "/projects.toml")
     @projects = list
     p
   end
@@ -245,6 +271,16 @@ pub class Store
   # A task whose file is gone or unreadable is forgotten.
   pub def reload_file(path : String) : Task?
     p = canon(path) || return nil
+    if p == @root + "/projects.toml"
+      old = @projects.map { |q| q.key }
+      reload_projects
+      now = @projects.map { |q| q.key }
+      old.reject { |k| now.includes?(k) }.each do |k|
+        @tasks.select { |t| @keys[t.id]? == k }.each { |t| forget(t.id) }
+      end
+      now.reject { |k| old.includes?(k) }.each { |k| read_folder(k) }
+      return nil
+    end
     rest = p[(@root.bytesize + 1)...p.bytesize]
     parts = rest.split("/")
     return nil unless parts.size == 2
@@ -259,7 +295,8 @@ pub class Store
     end
     # shortcut: an editor's delete-then-rename can remove the file between this check and the read, which panics; iyi has no non-raising File.read.
     unless File.exists?(p)
-      @errors.delete(key + "/" + name)
+      @file_errors.delete(key + "/" + name)
+      @stamps.delete(p)
       return nil
     end
     read_into(key, p)
@@ -268,12 +305,26 @@ pub class Store
   # The modification time the store last saw or wrote, in nanoseconds.
   pub def mtime(path : String) : Int64?
     p = canon(path) || return nil
-    @mtimes[p]?
+    if s = @stamps[p]?
+      return s[0]
+    end
+    nil
+  end
+
+  # The {mtime ns, size} the store last saw or wrote.
+  pub def stamp(path : String) : {Int64, Int64}?
+    p = canon(path) || return nil
+    @stamps[p]?
+  end
+
+  # Every file the store holds a stamp for: task files and projects.toml.
+  pub def stamped_paths : Array(String)
+    @stamps.keys
   end
 
   # path spelled the way the store keys it, or nil when it is not under the root.
   # The drive letter of a Windows root compares without case.
-  def canon(path : String) : String?
+  pub def canon(path : String) : String?
     p = clean_path(File.expand_path(clean_path(path)))
     prefix = @root + "/"
     return nil if p.bytesize <= prefix.bytesize
@@ -301,14 +352,14 @@ pub class Store
   end
 
   def remember(path : String) : Nil
-    if m = mtime_ns(path)
-      @mtimes[path] = m
+    if m = file_stamp(path)
+      @stamps[path] = m
     end
   end
 
   def forget(id : String) : Nil
     if path = @paths[id]?
-      @mtimes.delete(path)
+      @stamps.delete(path)
     end
     @tasks = @tasks.reject { |t| t.id == id }
     @keys.delete(id)
@@ -318,16 +369,20 @@ pub class Store
   # Parses one file into the list; a file that cannot be read goes to errors and nowhere else.
   def read_into(key : String, path : String) : Task?
     rel = key + "/" + File.basename(path)
-    @errors.delete(rel)
-    seen = mtime_ns(path)   # before the read, so a write landing in between is not recorded as seen
+    @file_errors.delete(rel)
+    seen = file_stamp(path)   # before the read, so a write landing in between is not recorded as seen
     t = parse_task(File.read(path))
+    # broken files are stamped too, so they are reported once and not on every scan
     if t.nil? || @keys.has_key?(t.id)
-      @errors << rel
+      @file_errors << rel
+      if m = seen
+        @stamps[path] = m
+      end
       return nil
     end
     register(t, key, path)
     if m = seen
-      @mtimes[path] = m
+      @stamps[path] = m
     end
     t
   end
