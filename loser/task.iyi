@@ -5,6 +5,7 @@ module loser/task
 import std/yaml::{YAML, Any}
 import std/json::{JSON}
 
+@[SafeReach("a literal, never written: only read, by the UI and the worker")]
 pub STATUSES = ["todo", "doing", "done"]
 
 pub def status_title(s : String) : String

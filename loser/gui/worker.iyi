@@ -1,0 +1,64 @@
+# The background loop: scans the root every 2 s; syncs with GitHub at start, every 5 min
+# and on request. It runs inside spawn_parallel, so it holds only Share values, calls no
+# C function and touches no widget: results go to the window as Strings through the inbox.
+
+module loser/gui/worker
+
+import std/atomic
+import std/mutex::{Mutex}
+import github.com/tuntii/kilim/kilim/inbox::{Inbox}
+import loser/changes
+import loser/sync
+
+TICK_MS = 250
+SCAN_TICKS = 8       # 2 s
+SYNC_TICKS = 1200    # 5 min
+
+pub class Worker
+  def initialize(@root : String, @inbox : Inbox(String))
+    @stopped = Atomic(Int32).new(0)
+    @wanted = Atomic(Int32).new(1)   # the first sync runs at start
+    @only = Mutex.new { nil.as(String?) }
+  end
+
+  # A sync of every linked project (nil) or of one, as soon as the loop gets to it.
+  pub def request_sync(only : String?) : Nil
+    @only.update { |_o| only }
+    @wanted.set(1)
+    nil
+  end
+
+  pub def stop : Nil
+    @stopped.set(1)
+    nil
+  end
+
+  pub def run : Nil
+    tick = 0
+    last = ""
+    until @stopped.get == 1
+      asked = @wanted.swap(0) == 1
+      if asked || (tick > 0 && tick % SYNC_TICKS == 0)
+        only = asked ? @only.get { |o| o } : nil
+        @inbox.send("sync-start")
+        @inbox.send("sync\n" + Loser::Sync.run_sync(@root, only.is_a?(String) ? only : nil))
+      end
+      if tick % SCAN_TICKS == 0
+        # an unchanged root says nothing new: the UI's own writes change the scan too
+        s = Loser::Changes.scan(@root)
+        @inbox.send("scan\n" + s) unless s == last
+        last = s
+      end
+      # a panic on the UI thread cancels the group: sleep then answers at once, so stop
+      break if sleep(TICK_MS).is_a?(Cancelled)
+      tick += 1
+    end
+    nil
+  end
+
+  @root : String
+  @inbox : Inbox(String)
+  @stopped : Atomic(Int32)
+  @wanted : Atomic(Int32)
+  @only : Mutex(String?)
+end

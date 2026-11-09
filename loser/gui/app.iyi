@@ -1,37 +1,48 @@
 # The main window's widgets: projects, tasks of the selected project, the selected task.
-# Edits autosave 500 ms after the last change; status changes save at once.
+# Edits autosave 500 ms after the last change; status changes save at once. Outside
+# changes arrive from the worker (on_message) and are merged into unsaved edits.
 
 module loser/gui/app
 
+import std/file::{File}
+import std/time::{Time}
 import github.com/tuntii/kilim
 import github.com/tuntii/kilim/kilim/widget::{Widget}
 import github.com/tuntii/kilim/kilim/box::{Box}
 import github.com/tuntii/kilim/kilim/label::{Label}
+import github.com/tuntii/kilim/kilim/button::{Button}
 import github.com/tuntii/kilim/kilim/textbox::{Textbox}
 import github.com/tuntii/kilim/kilim/text_area::{TextArea}
 import github.com/tuntii/kilim/kilim/list_view::{ListView, ListRow}
 import github.com/tuntii/kilim/kilim/dropdown::{Dropdown}
+import github.com/tuntii/kilim/kilim/event::{Key, Mods, KeyDown}
 import github.com/tuntii/kilim/kilim/window::{Window}
-import loser/store::{Store}
-import loser/task::{Task, STATUSES, status_title}
+import loser/store::{Store, file_stamp}
+import loser/task::{Task, STATUSES, status_title, parse_task}
 import loser/projects::{Project}
+import loser/changes::{changed_paths, merge, write_conflict, WriteError}
+import loser/gui/worker::{Worker}
 
 AUTOSAVE_MS = 500
+RELOAD_SLICE = 20
 
-# The text fields' on_change closures are built before the App is: they reach it through this.
+# Closures built before the App is (text fields, buttons) reach it through this.
 class Hook
   property app : App? = nil
 
-  def edited : Nil
+  def run(&fn : App -> Nil) : Nil
     if a = @app
-      a.edited
+      fn.call(a)
     end
   end
 end
 
 pub class App
   getter root : Widget
-  property win : Window? = nil
+  getter store : Store
+  getter win : Window? = nil
+  # Opens the New project form; main sets it (the form's module imports this one).
+  property on_new_project : (-> Nil)? = nil
   getter projects : ListView
   getter tasks : ListView
   getter search : Textbox
@@ -43,19 +54,31 @@ pub class App
   getter notes : TextArea
   getter status_line : Label
   getter no_task : Label
+  getter new_project_button : Button
+  getter sync_button : Button
+  getter new_task_button : Button
+  getter delete_button : Button
   # Edits not on disk yet (a failed save keeps them).
   getter dirty : Bool
 
+  # Outside changes still to reload (spread over frames).
+  pub def pending? : Bool
+    !@pending.empty?
+  end
+
   def initialize(@store : Store)
     hook = Hook.new
-    on_edit = ->(_s : String) { hook.edited; nil }
+    on_edit = ->(_s : String) { hook.run { |a| a.edited }; nil }
     @project = nil.as(String?)
     @task = nil.as(String?)
     @dirty = false
     @timer = nil.as(Int32?)
+    @worker = nil.as(Worker?)
+    @pending = [] of String
+    @reload_timer = nil.as(Int32?)
     @projects = Kilim.list_view
     @tasks = Kilim.list_view
-    @search = Kilim.textbox("Search", sizing: Kilim.fit)
+    @search = Kilim.textbox("Search", on_change: ->(_s : String) { hook.run { |a| a.search_changed }; nil }, sizing: Kilim.fit)
     @title = Kilim.textbox("Title", on_change: on_edit)
     @title_ro = Kilim.label("")
     @status = Kilim.dropdown(STATUSES.map { |s| status_title(s) })
@@ -63,14 +86,17 @@ pub class App
     @labels_ro = Kilim.label("")
     @notes = Kilim.text_area("Notes", on_change: on_edit)
     @status_line = Kilim.label("")
+    @new_project_button = Kilim.button("New project", -> { hook.run { |a| a.new_project }; nil })
+    @sync_button = Kilim.button("Sync", -> { hook.run { |a| a.request_sync }; nil })
+    @new_task_button = Kilim.button("New task", -> { hook.run { |a| a.new_task }; nil })
+    @delete_button = Kilim.button("Delete", -> { hook.run { |a| a.delete_selected }; nil })
     @title_slot = Kilim.row([@title] of Widget)
     @labels_slot = Kilim.row([@labels] of Widget)
-    # Task 9 wires these.
-    left = Kilim.column([Kilim.label("Projects"), Kilim.scroll(@projects), Kilim.button("New project"), Kilim.button("Sync")] of Widget,
+    left = Kilim.column([Kilim.label("Projects"), Kilim.scroll(@projects), @new_project_button, @sync_button] of Widget,
       padding: 8, spacing: 8, sizing: Kilim.fixed(220))
-    middle = Kilim.column([@search, Kilim.scroll(@tasks), Kilim.button("New task")] of Widget,
+    middle = Kilim.column([@search, Kilim.scroll(@tasks), @new_task_button] of Widget,
       padding: 8, spacing: 8, sizing: Kilim.fixed(380))
-    @editor = Kilim.column([@title_slot, Kilim.row([@status] of Widget), @labels_slot, @notes, Kilim.row([Kilim.button("Delete")] of Widget)] of Widget,
+    @editor = Kilim.column([@title_slot, Kilim.row([@status] of Widget), @labels_slot, @notes, Kilim.row([@delete_button] of Widget)] of Widget,
       spacing: 8, sizing: Kilim.fill)
     # Without a task there is nothing to type into: text typed there would have nowhere to go.
     @no_task = Kilim.label("No task selected")
@@ -85,6 +111,30 @@ pub class App
     show_task
     errs = @store.errors
     say(errs.empty? ? @store.root : "Could not read: " + errs.join(", "))
+  end
+
+  # Ties the App to its window: shortcuts and the worker's inbox. Answers the worker, which main runs in a parallel task.
+  pub def attach(w : Window) : Worker
+    @win = w
+    worker = Worker.new(@store.root, w.inbox(String) { |m| on_message(m); nil })
+    @worker = worker
+    w.shortcut(Key::N) { new_task; nil }
+    w.shortcut(Key::F) { w.ui.focus(@search); nil }
+    # not while a text field has focus: there Delete deletes a character
+    w.shortcut(Key::Delete, primary: false) { delete_selected; nil }
+    worker
+  end
+
+  # What the worker posts: "scan\n<scan output>", "sync-start", "sync\n<summary>".
+  pub def on_message(m : String) : Nil
+    if m.starts_with?("scan\n")
+      outside_changes(m[5, m.bytesize - 5])
+    elsif m == "sync-start"
+      say("Syncing…")
+    elsif m.starts_with?("sync\n")
+      # the files sync wrote arrive with the next scan
+      say(m[5, m.bytesize - 5])
+    end
   end
 
   pub def current_project : Project?
@@ -128,7 +178,14 @@ pub class App
     @projects.rows = @store.projects.map { |p| ListRow.new(p.name, "", false, p.key) }
     rows = [] of ListRow
     if key = @project
+      q = @search.text.strip
       list = @store.tasks(key)
+      unless q.empty?
+        hits = Hash(String, Bool).new
+        @store.search(key, nil, q).each { |t| hits[t.id] = true }
+        # the selected task keeps its row: an edit that stops it matching must not take it away mid-typing
+        list = list.select { |t| t.id == @task || hits.has_key?(t.id) }
+      end
       STATUSES.each do |st|
         group = list.select { |t| t.status == st }
         rows << ListRow.new(status_title(st) + " (" + group.size.to_s + ")", "", true)
@@ -155,6 +212,7 @@ pub class App
       @dirty = false
       return
     end
+    note = take_outside(t)
     unless t.github?
       # an emptied title keeps the old one: a task file needs a title
       t.title = @title.text unless @title.text.strip.empty?
@@ -168,6 +226,9 @@ pub class App
     end
     @dirty = false
     refresh
+    if n = note
+      say(n)
+    end
   end
 
   pub def say(s : String) : Nil
@@ -192,6 +253,131 @@ pub class App
     flush
   end
 
+  def search_changed : Nil
+    # the task being edited may leave the list: its edits go to disk first
+    flush
+    refresh
+  end
+
+  def new_project : Nil
+    if f = @on_new_project
+      f.call
+    end
+  end
+
+  def request_sync : Nil
+    if w = @worker
+      w.request_sync(nil)
+    end
+  end
+
+  # A task titled "New task" in the current project, selected, its title ready to be typed over.
+  def new_task : Nil
+    key = @project
+    if key.nil?
+      say("Select a project first")
+      return
+    end
+    flush
+    return if @dirty
+    made = @store.create(key, "New task")
+    if made.is_a?(String)
+      say("Not created: " + made)
+      return
+    end
+    @search.text = ""
+    @task = made.id
+    refresh
+    show_task
+    if w = @win
+      w.ui.focus(@title)
+      # Textbox has no select-all call: its own Ctrl+A selects, so typing replaces "New task".
+      @title.handle(KeyDown.new(Key::A, Mods.new(primary: true)), w.ui)
+    end
+  end
+
+  def delete_selected : Nil
+    t = current_task || return
+    w = @win || return
+    # unsaved notes of a GitHub task stay in its (hidden) file
+    flush
+    id = t.id
+    Kilim.confirm(w.ui, "Delete task", "Delete \"" + t.title + "\"?", "Delete") do
+      if gone = @store.find(id)
+        @store.delete(gone)
+      end
+      refresh
+      w.ui.focus(@tasks)
+      nil
+    end
+  end
+
+  # The worker's scan: queue what changed on disk since the store last saw it, the task being edited first.
+  def outside_changes(scan : String) : Nil
+    paths = changed_paths(@store, scan)
+    return if paths.empty?
+    @pending = (@pending + paths).uniq
+    if t = current_task
+      cur = @store.path_of(t)
+      @pending = [cur] + @pending.reject { |p| p == cur } if @pending.includes?(cur)
+    end
+    reload_pending if @reload_timer.nil?
+  end
+
+  # Reloads at most RELOAD_SLICE queued files, then lets a frame through before the next slice:
+  # a git pull of 200 files must not freeze typing (about 0.2 ms per file).
+  def reload_pending : Nil
+    @reload_timer = nil
+    return if @pending.empty?
+    n = @pending.size < RELOAD_SLICE ? @pending.size : RELOAD_SLICE
+    slice = @pending[0, n]
+    @pending = @pending[n, @pending.size - n]
+    # Unsaved edits first: flush merges an outside change of their file, or writes it back if it is gone.
+    flush if @dirty
+    before = @store.errors
+    cur = (t = current_task) ? @store.path_of(t) : nil
+    slice.each { |p| @store.reload_file(p) }
+    refresh
+    show_task if cur && slice.includes?(cur)
+    errs = @store.errors
+    say("Could not read: " + errs.join(", ")) unless errs.empty? || errs == before
+    return if @pending.empty?
+    if w = @win
+      @reload_timer = w.after(1) { reload_pending }
+    else
+      reload_pending
+    end
+  end
+
+  # Before a save: the task's file changed or vanished since the store last saw it. Status and
+  # labels take the outside value, title and notes are merged (Loser::Changes.merge); text that
+  # cannot be merged is kept in a conflict file. Answers what the status line should say.
+  def take_outside(t : Task) : String?
+    path = @store.path_of(t)
+    return nil if file_stamp(path) == @store.stamp(path)
+    return "\"" + t.title + "\" was deleted outside; saved your text again" unless File.exists?(path)
+    text = File.read(path)
+    conflict = true
+    o = parse_task(text)
+    if o && o.id == t.id
+      m = merge(t.title, t.notes, t.github? ? t.title : @title.text, @notes.text, o.title, o.notes)
+      conflict = m.conflict
+      t.title = m.title
+      t.notes = m.notes
+      t.status = o.status
+      t.labels = o.labels
+      t.github = o.github
+      t.github_kind = o.github_kind
+      t.github_state = o.github_state
+      t.hidden = o.hidden
+      show_task
+    end
+    return nil unless conflict
+    kept = write_conflict(@store, text, t.id, Time.utc)
+    return "Not saved: " + kept.message if kept.is_a?(WriteError)
+    "Saved your text; the other version is in " + File.basename(kept)
+  end
+
   # Both lists show @project and @task as selected.
   def mark : Nil
     @projects.selected = @projects.rows.index { |r| r.key == @project }
@@ -199,6 +385,7 @@ pub class App
   end
 
   # Fills the right pane from the current task; GitHub owns a GitHub task's title and labels.
+  # A field whose text is already right is left alone, so its caret stays where it was.
   def show_task : Nil
     t = current_task
     swap(@right, t ? @editor : @no_task)
@@ -207,12 +394,17 @@ pub class App
     swap(@labels_slot, gh ? @labels_ro : @labels)
     title = t ? t.title : ""
     labels = t ? t.labels.join(", ") : ""
-    @title.text = title
+    notes = t ? t.notes : ""
+    @title.text = title unless @title.text == title
     @title_ro.text = title
-    @labels.text = labels
+    @labels.text = labels unless @labels.text == labels
     @labels_ro.text = labels
     @status.selected = t ? (STATUSES.index(t.status) || 0) : 0
-    @notes.text = t ? t.notes : ""
+    @notes.text = notes unless @notes.text == notes
+    # Keyboard focus must not stay on a field that just left the window.
+    if (w = @win) && (f = w.ui.focused) && !f.attached_to?(@root)
+      w.ui.focus(@tasks)
+    end
   end
 
   def swap(slot : Box, w : Widget) : Nil
