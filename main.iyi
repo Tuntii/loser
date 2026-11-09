@@ -2,13 +2,16 @@ module main
 
 import std/env::{ENV}
 import std/file::{File}
+import std/dir::{Dir}
 import loser/paths
 import loser/mcp
 import loser/sync
 import loser/testkit
+import loser/changes
 import loser/store::{Store}
 import loser/task::{Task}
 import loser/gui/app::{App}
+import loser/gui/forms::{new_project_form}
 import github.com/tuntii/kilim
 import github.com/tuntii/kilim/kilim/widget::{Widget}
 import github.com/tuntii/kilim/kilim/window::{Window}
@@ -50,16 +53,51 @@ def row_key(app : App, title : String) : String
   r.key
 end
 
-def file_of(id : String) : String
+def task_path(id : String) : String
   key = id.starts_with?("beta-") ? "beta" : "alpha"
-  File.read(Loser::Paths.root + "/" + key + "/" + id + ".md")
+  Loser::Paths.root + "/" + key + "/" + id + ".md"
 end
+
+def file_of(id : String) : String
+  File.read(task_path(id))
+end
+
+def press(win : Window, k : Key) : Nil
+  win.inject KeyDown.new(k, Mods.new)
+end
+
+def ctrl(win : Window, k : Key) : Nil
+  win.inject KeyDown.new(k, Mods.new(primary: true))
+end
+
+def titles(app : App) : Array(String)
+  app.tasks.rows.reject(&.header).map(&.title)
+end
+
+# What the worker would post: the root as it is now on disk.
+def outside(app : App) : Nil
+  app.on_message("scan\n" + Loser::Changes.scan(Loser::Paths.root))
+end
+
+# Steps the window until the status line reads `text` (answers from the worker come through the inbox).
+def wait_status(win : Window, app : App, text : String) : Nil
+  waited = 0
+  while app.status_line.text != text
+    fail("status line is " + app.status_line.text.inspect + ", waited 5 s for " + text.inspect) if waited >= 5000
+    sleep(20)
+    waited += 20
+    win.step
+  end
+end
+
+NO_REPO = "GitHub: no project is linked to a repo"
 
 def seed(root : String) : Nil
   st = Store.new(root)
   st.load
   fail("add Alpha") if st.add_project("Alpha", nil).is_a?(String)
-  fail("add Beta") if st.add_project("Beta", "Tuntii/loser").is_a?(String)
+  # no repo: the worker's syncs must not reach the real GitHub
+  fail("add Beta") if st.add_project("Beta", nil).is_a?(String)
   fail("create") if st.create("alpha", "Write the spec", "first notes", "todo", ["docs"]).is_a?(String)
   fail("create") if st.create("alpha", "Build the window", "", "doing", ["gui", "kilim"]).is_a?(String)
   fail("create") if st.create("alpha", "Ship v0.1.0", "", "done").is_a?(String)
@@ -74,6 +112,9 @@ def seed(root : String) : Nil
 end
 
 def selftest(win : Window, app : App, bmp : String) : Nil
+  # The worker syncs once at startup and answers through the inbox.
+  wait_status(win, app, NO_REPO)
+
   # No task selected: no editors to type into.
   win.step
   fail("editors shown without a task") if editors?(app)
@@ -151,6 +192,138 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("GitHub title changed:\n" + f) unless f.includes?("title: \"Crash on start\"")
   fail("GitHub labels changed:\n" + f) unless f.includes?("labels: [\"bug\"]")
 
+  # Tab walks the panes in widget tree order, the buttons included.
+  choose(win, app.projects, "alpha")
+  choose(win, app.tasks, row_key(app, "Build the window"))
+  order = [app.projects, app.new_project_button, app.sync_button, app.search, app.tasks, app.new_task_button,
+           app.title, app.status, app.labels, app.notes, app.delete_button] of Widget
+  win.ui.focus(nil)
+  order.each_with_index do |w, i|
+    press(win, Key::Tab)
+    fail("Tab " + (i + 1).to_s + " did not reach widget " + i.to_s + " of the order") unless win.ui.focused == w
+  end
+
+  # Ctrl+N: a new task, its title focused and selected, so typing replaces it.
+  ctrl(win, Key::N)
+  nt = app.current_task || fail("Ctrl+N selected no task")
+  new_id = nt.id
+  fail("new task title " + nt.title.inspect) unless nt.title == "New task"
+  fail("title not focused after Ctrl+N") unless win.ui.focused == app.title
+  win.inject TextInput.new("Plan the release")
+  fail("title field after typing: " + app.title.text.inspect) unless app.title.text == "Plan the release"
+  sleep(550)
+  win.step
+  fail("new title not saved:\n" + file_of(new_id)) unless file_of(new_id).includes?("title: \"Plan the release\"")
+
+  # Ctrl+F: search narrows the list; clearing it shows everything again.
+  ctrl(win, Key::F)
+  fail("search not focused after Ctrl+F") unless win.ui.focused == app.search
+  win.inject TextInput.new("spec")
+  fail("search rows: " + titles(app).inspect) unless titles(app) == ["Write the spec"]
+  ctrl(win, Key::A)
+  press(win, Key::Backspace)
+  fail("rows after clearing the search: " + titles(app).inspect) unless titles(app).size == 4
+
+  # Delete with the task list focused asks first; Enter confirms and the file goes.
+  choose(win, app.tasks, new_id)
+  press(win, Key::Delete)
+  fail("Delete did not ask") unless win.ui.modal
+  press(win, Key::Enter)
+  fail("confirm dialog still open") if win.ui.modal
+  fail("task file still there") if File.exists?(task_path(new_id))
+  fail("deleted row still listed") if app.tasks.rows.any? { |r| r.key == new_id }
+  fail("focus not on the task list after Delete") unless win.ui.focused == app.tasks
+
+  # Delete inside the notes deletes a character, not the task.
+  choose(win, app.tasks, row_key(app, "Build the window"))
+  click(win, app.notes)
+  win.inject TextInput.new("xy")
+  press(win, Key::Left)
+  press(win, Key::Delete)
+  fail("Delete in the notes opened a dialog") if win.ui.modal
+  fail("notes after Delete: " + app.notes.text.inspect) unless app.notes.text == "x"
+  app.flush
+
+  # Sync through the worker (spawn_parallel, then the inbox): no project is linked to a repo.
+  app.say("")
+  click(win, app.sync_button)
+  wait_status(win, app, NO_REPO)
+
+  # New project: an invalid repo is refused, a valid one creates and selects the project.
+  toml = Loser::Paths.root + "/projects.toml"
+  click(win, app.new_project_button)
+  fail("no New project form") unless win.ui.modal
+  win.inject TextInput.new("Gamma")
+  press(win, Key::Tab)
+  win.inject TextInput.new("not a repo")
+  press(win, Key::Enter)
+  fail("invalid repo, status line: " + app.status_line.text.inspect) unless app.status_line.text.includes?("invalid repo")
+  fail("form closed on an invalid repo") unless win.ui.modal
+  fail("project created with an invalid repo") if File.read(toml).includes?("Gamma")
+  ctrl(win, Key::A)
+  win.inject TextInput.new("Tuntii/loser")
+  press(win, Key::Enter)
+  fail("form still open after Create") if win.ui.modal
+  fail("Gamma not selected") unless (gp = app.current_project) && gp.key == "gamma" && gp.repo == "Tuntii/loser"
+  fail("Gamma not in projects.toml:\n" + File.read(toml)) unless File.read(toml).includes?("Tuntii/loser")
+
+  # An outside append to the notes of the task being edited joins the editor's text and is saved.
+  choose(win, app.projects, "alpha")
+  choose(win, app.tasks, id)
+  click(win, app.notes)
+  press(win, Key::End)
+  win.inject TextInput.new(" mine")
+  mine = app.notes.text
+  Loser::Paths.write_atomic(task_path(id), file_of(id) + "outside line\n")
+  outside(app)
+  fail("append not merged: " + app.notes.text.inspect) unless app.notes.text == mine + "outside line\n"
+  fail("merged notes not saved:\n" + file_of(id)) unless file_of(id).ends_with?(mine + "outside line\n")
+
+  # Both sides rewrote the notes: mine is saved, the outside version goes to a conflict file.
+  # (the merge set the notes anew, so the caret is at the start: compare whole texts)
+  win.inject TextInput.new("again")
+  mine = app.notes.text
+  text = file_of(id)
+  cut = text.index("\n---\n") || fail("no front matter end")
+  Loser::Paths.write_atomic(task_path(id), text[0, cut + 5] + "rewritten outside\n")
+  outside(app)
+  fail("conflict, status line: " + app.status_line.text.inspect) unless app.status_line.text.starts_with?("Saved your text; the other version is in " + id + ".conflict-")
+  fail("conflict lost my text:\n" + file_of(id)) unless file_of(id).ends_with?("\n---\n" + mine) && app.notes.text == mine
+  dir = Loser::Paths.root + "/alpha"
+  kept = Dir.children(dir).find { |n| n.includes?(".conflict-") } || fail("no conflict file")
+  fail("conflict file: " + File.read(dir + "/" + kept)) unless File.read(dir + "/" + kept).ends_with?("rewritten outside\n")
+
+  # The task being edited is deleted outside: unsaved text is written back.
+  win.inject TextInput.new(" kept")
+  mine = app.notes.text
+  File.delete(task_path(id))
+  outside(app)
+  fail("unsaved text not written back") unless File.exists?(task_path(id)) && file_of(id).ends_with?("\n---\n" + mine)
+  fail("deleted outside, status line: " + app.status_line.text.inspect) unless app.status_line.text.includes?("deleted")
+
+  # Deleted outside without unsaved changes: deselected, focus back on the list.
+  click(win, app.notes)
+  File.delete(task_path(id))
+  outside(app)
+  fail("deleted task still selected") if app.current_task
+  fail("editors shown for a deleted task") if editors?(app)
+  fail("focus not on the task list after an outside delete") unless win.ui.focused == app.tasks
+
+  # An outside rewrite of a task not being edited shows in the list.
+  ship = row_key(app, "Ship v0.1.0")
+  Loser::Paths.write_atomic(task_path(ship), file_of(ship).gsub("title: \"Ship v0.1.0\"", "title: \"Ship it now\""))
+  outside(app)
+  fail("outside title not shown: " + titles(app).inspect) unless titles(app).includes?("Ship it now")
+
+  # An outside edit of projects.toml adding a project shows it on the left.
+  Loser::Paths.write_atomic(toml, File.read(toml) + "\n[[project]]\nkey = \"delta\"\nname = \"Delta\"\n")
+  outside(app)
+  fail("Delta not listed: " + app.projects.rows.map(&.title).inspect) unless app.projects.rows.any? { |r| r.title == "Delta" }
+
+  # A sync summary goes to the status line.
+  app.on_message("sync\nGitHub: not logged in (run gh auth login)")
+  fail("sync summary not shown: " + app.status_line.text.inspect) unless app.status_line.text == "GitHub: not logged in (run gh auth login)"
+
   win.step
   win.screenshot(bmp)
   fail("no screenshot") unless File.exists?(bmp)
@@ -180,12 +353,18 @@ store = Store.new(Loser::Paths.root)
 store.load
 app = App.new(store)
 win = Kilim.window("loser", 1100, 700, app.root)
-app.win = win
-if bmp
-  selftest(win, app, bmp)
-else
-  win.run
-  app.flush
-  # the window is gone: the status line's message is the only trace of a failed last save
-  STDERR.puts "loser: " + app.status_line.text if app.dirty
+worker = app.attach(win)
+app.on_new_project = -> { win.ui.show_modal(new_project_form(app)); nil }
+# The group joins the worker once the window is gone.
+group do |g|
+  g.spawn_parallel { worker.run; nil }
+  if bmp
+    selftest(win, app, bmp)
+  else
+    win.run
+    app.flush
+    # the window is gone: the status line's message is the only trace of a failed last save
+    STDERR.puts "loser: " + app.status_line.text if app.dirty
+  end
+  worker.stop
 end

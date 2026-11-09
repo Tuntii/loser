@@ -1,0 +1,67 @@
+# The New project form, shown as a modal: a name and an optional GitHub repo; the key comes from the name.
+
+module loser/gui/forms
+
+import github.com/tuntii/kilim
+import github.com/tuntii/kilim/kilim/widget::{Widget, Context, Sizing}
+import github.com/tuntii/kilim/kilim/box::{Box, Axis}
+import github.com/tuntii/kilim/kilim/canvas::{Canvas}
+import github.com/tuntii/kilim/kilim/textbox::{Textbox}
+import github.com/tuntii/kilim/kilim/event::{Event, KeyDown}
+import github.com/tuntii/kilim/kilim/theme::{POPUP_BG, BORDER}
+import loser/gui/app::{App}
+
+FORM_W = 320_f32
+
+# A column on the popup background; Escape cancels.
+class Form < Box
+  def initialize(kids : Array(Widget), @cancel : -> Nil)
+    super(Axis::Column, kids, 16_f32, 8_f32, Sizing.fit)
+  end
+
+  pub def draw(c : Canvas) : Nil
+    c.fill_rect(bounds, POPUP_BG)
+    super
+    c.stroke_rect(bounds, BORDER)
+  end
+
+  pub def handle(e : Event, ui : Context) : Bool
+    return false unless e.is_a?(KeyDown) && e.key.escape?
+    @cancel.call
+    true
+  end
+
+  @cancel : -> Nil
+end
+
+pub def new_project_form(app : App) : Widget
+  # Enter in either field creates: the fields' on_submit is made before the fields are.
+  fields = [] of Textbox
+  create = -> { create_project(app, fields[0].text, fields[1].text); nil }
+  submit = ->(_s : String) { create.call; nil }
+  name = Kilim.textbox("Name", on_submit: submit, sizing: Kilim.fixed(FORM_W))
+  repo = Kilim.textbox("GitHub repo: owner/name (optional)", on_submit: submit, sizing: Kilim.fixed(FORM_W))
+  fields << name << repo
+  cancel = -> { close(app); nil }
+  buttons = Kilim.row([Kilim.row(sizing: Kilim.fill), Kilim.button("Cancel", cancel), Kilim.button("Create", create)] of Widget, spacing: 8)
+  Form.new([Kilim.label("New project"), Kilim.row([name] of Widget), Kilim.row([repo] of Widget), buttons] of Widget, cancel)
+end
+
+# The Store refuses an empty name, an invalid repo and a projects.toml it cannot read in full;
+# the form then stays open and the status line says why.
+def create_project(app : App, name : String, repo : String) : Nil
+  r = repo.strip
+  made = app.store.add_project(name.strip, r.empty? ? nil : r)
+  if made.is_a?(String)
+    app.say("Project not created: " + made)
+    return
+  end
+  close(app)
+  app.select_project(made.key)
+end
+
+def close(app : App) : Nil
+  if w = app.win
+    w.ui.close_modal
+  end
+end
