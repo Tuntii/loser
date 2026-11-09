@@ -227,12 +227,16 @@ pub class Store
   # A task the store does not know is ignored.
   pub def delete(t : Task) : Nil
     return unless @paths.has_key?(t.id)
+    path = @paths[t.id]
     if t.github?
-      t.hidden = true
-      save(t)
+      # read again: notes appended outside a moment ago stay in the hidden file
+      cur = reload_file(path)
+      return if cur.nil? && File.exists?(path)   # unreadable: never overwritten
+      h = cur || t
+      h.hidden = true
+      save(h)
       return
     end
-    path = @paths[t.id]
     File.delete(path) if File.exists?(path)
     forget(t.id)
   end
