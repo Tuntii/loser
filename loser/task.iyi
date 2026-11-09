@@ -46,13 +46,14 @@ pub def parse_task(text : String) : Task?
     close += 1
   end
   return nil if close >= lines.size
-  doc = YAML.parse?(lines[1...close].join("\n") + "\n") || return nil
+  fm = lines[1...close].join("\n") + "\n"
+  doc = YAML.parse?(fm) || return nil
   map = doc.as_h? || return nil
   return nil if map.empty?
-  id = field_s(doc, "id") || return nil
-  title = field_s(doc, "title") || return nil
+  id = field_s(doc, "id", fm) || return nil
+  title = field_s(doc, "title", fm) || return nil
   t = Task.new(id, title)
-  st = field_s(doc, "status") || "todo"
+  st = field_s(doc, "status", fm) || "todo"
   t.status = STATUSES.includes?(st) ? st : "todo"
   if lv = doc["labels"]?
     if arr = lv.as_a?
@@ -61,10 +62,10 @@ pub def parse_task(text : String) : Task?
       t.labels << s
     end
   end
-  t.github = field_s(doc, "github")
-  t.github_kind = field_s(doc, "github_kind")
-  t.github_state = field_s(doc, "github_state")
-  t.updated = field_s(doc, "updated") || ""
+  t.github = field_s(doc, "github", fm)
+  t.github_kind = field_s(doc, "github_kind", fm)
+  t.github_state = field_s(doc, "github_state", fm)
+  t.updated = field_s(doc, "updated", fm) || ""
   t.hidden = (doc["hidden"]? && doc["hidden"].as_bool?) || false
   t.notes = lines[(close + 1)...lines.size].join("\n")
   t
@@ -90,6 +91,7 @@ pub def render_task(t : Task) : String
   s + "---\n" + t.notes
 end
 
+# shortcut: label elements inside a flow list use the parsed value (2024.10 reads as 2024.1); take source text if that matters.
 # A scalar read as text: strings as they are, numbers and booleans by their value.
 def scalar_s(v : Any) : String?
   if s = v.as_s?
@@ -103,8 +105,23 @@ def scalar_s(v : Any) : String?
   end
 end
 
-def field_s(doc : Any, key : String) : String?
-  if v = doc[key]?
-    scalar_s(v)
+# A string as it is; a number or bool as the text the file spells (2024.10 stays 2024.10).
+# shortcut: a duplicated or indented key is not looked for, the first `key:` line at column 0 wins.
+def field_s(doc : Any, key : String, fm : String) : String?
+  v = doc[key]?
+  return nil if v.nil?
+  if s = v.as_s?
+    return s
   end
+  return nil unless scalar_s(v)
+  fm.split("\n").each do |line|
+    if line.starts_with?(key + ":")
+      rest = line[key.bytesize + 1, line.bytesize]
+      if c = rest.index(" #")
+        rest = rest[0, c]
+      end
+      return rest.strip
+    end
+  end
+  scalar_s(v)
 end

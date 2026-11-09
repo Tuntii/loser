@@ -63,6 +63,13 @@ def main : Int32
     expect_eq((Loser::Task.parse_task(Loser::Task.render_task(r)) || raise("rt")).notes, notes, "notes round trip " + notes.inspect)
   end
 
+  ["title: 2024.10|2024.10", "title: 1e2|1e2", "title: 3.5  # comment|3.5", "title: 0x1F|0x1F"].each do |c|
+    parts = c.split("|")
+    x = Loser::Task.parse_task("---\nid: a\n" + parts[0] + "\n---\n") || raise("src nil")
+    expect_eq(x.title, parts[1], "source text of " + parts[0])
+  end
+  expect_eq((Loser::Task.parse_task("---\nid: 012\ntitle: b\n---\n") || raise("id012")).id, "012", "id 012")
+
   expect(Loser::Task.parse_task("---\nid: a\ntitle: b\n").nil?, "no closing ---")
   expect(Loser::Task.parse_task("---\nid: a\ntitle: [\n---\n").nil?, "invalid yaml")
   expect(Loser::Task.parse_task("---\nid: a\n---\n").nil?, "missing title")
