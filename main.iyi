@@ -3,6 +3,7 @@ module main
 import std/env::{ENV}
 import std/file::{File}
 import std/dir::{Dir}
+import loser/console
 import loser/paths
 import loser/mcp
 import loser/sync
@@ -388,6 +389,7 @@ if cmd == "sync"
   exit(summary.includes?(" new, ") && !summary.includes?("; ") ? 0 : 1)
 end
 
+Loser::Console.detach_if_owned unless ENV["LOSER_SELFTEST"]?
 bmp = ENV["LOSER_SELFTEST"]?
 if bmp
   # never the real ~/loser

@@ -1,0 +1,23 @@
+# A double-clicked loser.exe gets a console of its own, which would sit behind the window.
+# Started from a terminal, the console is shared with the shell and stays.
+
+module loser/console
+
+{% if flag?(:win32) %}
+  @[Link("kernel32")]
+  lib ::LibConsole
+    fun GetConsoleProcessList(list : UInt32*, count : UInt32) : UInt32
+    fun FreeConsole : Int32
+  end
+
+  pub def detach_if_owned : Nil
+    pid = 0_u32
+    # 1: only this process is attached; 0: no console at all; more: shared with a shell
+    LibConsole.FreeConsole if LibConsole.GetConsoleProcessList(pointerof(pid), 1_u32) == 1_u32
+    nil
+  end
+{% else %}
+  pub def detach_if_owned : Nil
+    nil
+  end
+{% end %}
