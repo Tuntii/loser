@@ -1,0 +1,334 @@
+# The store: every task and project under one root folder.
+
+module loser/store
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/random::{Random}
+import std/unicode::{Unicode}
+import std/time::{Time}
+import std/toml::{TOML, TOMLError}
+import loser/paths
+import loser/task::{Task, STATUSES, parse_task, render_task}
+import loser/projects::{Project, load_projects, save_projects, derive_key, valid_repo?}
+
+# Modification time of a file in nanoseconds since the epoch; nil when it is missing.
+# shortcut: File.info only has whole seconds, so two writes in one second look alike; upgrade when std grows sub-second times.
+pub def mtime_ns(path : String) : Int64?
+  info = File.info?(path) || return nil
+  info.modification_time * 1000000000_i64
+end
+
+def valid_key?(k : String) : Bool
+  return false if k.empty?
+  k.chars.each_with_index do |c, i|
+    ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && c == '-')
+    return false unless ok
+  end
+  true
+end
+
+def ignored_file?(name : String) : Bool
+  !name.ends_with?(".md") || name.includes?(".conflict-")
+end
+
+# Forward slashes, no trailing slash.
+def clean_path(p : String) : String
+  s = p.gsub("\\", "/")
+  while s.bytesize > 1 && s.ends_with?("/")
+    s = s.chomp("/")
+  end
+  s
+end
+
+# How many [[project]] tables projects.toml holds, readable or not.
+def entry_count(root : String) : Int32
+  path = root + "/projects.toml"
+  return 0 unless File.exists?(path)
+  doc = TOML.parse(File.read(path))
+  return 0 if doc.is_a?(TOMLError)
+  list = doc["project"]?
+  return 0 if list.nil?
+  arr = list.as_a? || return 0
+  arr.size
+end
+
+# Unicode case folding (String#downcase is ASCII only: "ÇAĞ" would not meet "çağ").
+# A file with ill-formed UTF-8 falls back to ASCII folding instead of panicking.
+def fold(s : String) : String
+  Unicode.valid?(s) ? Unicode.foldcase(s) : s.downcase
+end
+
+pub class Store
+  getter root : String
+  getter projects : Array(Project)
+  getter errors : Array(String)
+
+  def initialize(@root : String)
+    @root = clean_path(File.expand_path(clean_path(@root)))
+    @projects = [] of Project
+    @errors = [] of String
+    @tasks = [] of Task
+    @keys = Hash(String, String).new   # task id -> project key
+    @paths = Hash(String, String).new  # task id -> file path
+    @mtimes = Hash(String, Int64).new
+    @projects_broken = false
+  end
+
+  # False when projects.toml could not be read in full; add_project then refuses.
+  pub def projects_writable? : Bool
+    !@projects_broken
+  end
+
+  # Projects, then every <key>/*.md that is not *.conflict-*.md.
+  pub def load : Nil
+    @projects = [] of Project
+    @errors = [] of String
+    @tasks = [] of Task
+    @keys = Hash(String, String).new
+    @paths = Hash(String, String).new
+    @mtimes = Hash(String, Int64).new
+    @projects_broken = false
+    loaded = load_projects(@root)
+    if loaded.is_a?(String)
+      @projects_broken = true
+      @errors << loaded
+    else
+      loaded.each do |p|
+        if !valid_key?(p.key)
+          @errors << "projects.toml: invalid key " + p.key.inspect
+          @projects_broken = true
+        elsif @projects.any? { |q| q.key == p.key }
+          @errors << "projects.toml: duplicate key " + p.key.inspect
+          @projects_broken = true
+        else
+          @projects << p
+        end
+      end
+      # load_projects skips entries without key or name silently; saving would drop them.
+      if entry_count(@root) > loaded.size
+        @errors << "projects.toml: entry without key or name"
+        @projects_broken = true
+      end
+    end
+    @projects.each do |p|
+      dir = @root + "/" + p.key
+      next unless Dir.exists?(dir)
+      Dir.children(dir).sorted.each do |name|
+        next if ignored_file?(name)
+        read_into(p.key, dir + "/" + name)
+      end
+    end
+  end
+
+  # not hidden, status order, then title, then id
+  pub def tasks(key : String) : Array(Task)
+    list = @tasks.select { |t| !t.hidden && @keys[t.id]? == key }
+    list.sorted do |a, b|
+      sa = STATUSES.index(a.status) || 0
+      sb = STATUSES.index(b.status) || 0
+      if sa != sb
+        sa < sb ? -1 : 1
+      else
+        ta = fold(a.title)
+        tb = fold(b.title)
+        if ta != tb
+          ta < tb ? -1 : 1
+        else
+          a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)
+        end
+      end
+    end
+  end
+
+  pub def find(id : String) : Task?
+    @tasks.find { |t| t.id == id }
+  end
+
+  # Panics for a task the store does not know; use find first when the task may be stale.
+  pub def project_of(t : Task) : Project
+    key = @keys[t.id]? || raise("unknown task " + t.id)
+    @projects.find { |p| p.key == key } || raise("unknown project " + key)
+  end
+
+  pub def path_of(t : Task) : String
+    @paths[t.id]? || raise("unknown task " + t.id)
+  end
+
+  # The task, or the reason it could not be made.
+  pub def create(key : String, title : String, notes : String = "", status : String = "todo",
+                 labels : Array(String) = [] of String, now : Time = Time.utc) : Task | String
+    return "unknown project " + key unless @projects.any? { |p| p.key == key }
+    return "title is empty" if title.strip.empty?
+    rng = Random.new
+    stamp = now.to_s("%Y%m%d%H%M%S")
+    id = ""
+    path = ""
+    loop do
+      suffix = ""
+      3.times { suffix += ('a' + rng.rand(26)).to_s }
+      id = key + "-" + stamp + suffix
+      path = @root + "/" + key + "/" + id + ".md"
+      break unless File.exists?(path) || @keys.has_key?(id)
+    end
+    t = Task.new(id, title)
+    t.notes = notes
+    t.status = STATUSES.includes?(status) ? status : "todo"
+    t.labels = labels
+    register(t, key, path)
+    if err = save(t, now)
+      forget(id)
+      return err
+    end
+    t
+  end
+
+  # Sets updated (RFC 3339, UTC, seconds) and writes the file. A task the store forgot
+  # (its file vanished) is put back in memory first. nil on success, else the reason.
+  pub def save(t : Task, now : Time = Time.utc) : String?
+    unless @paths.has_key?(t.id)
+      key = project_key_of_id(t.id) || return "no project for task " + t.id
+      register(t, key, @root + "/" + key + "/" + t.id + ".md")
+    end
+    path = @paths[t.id]
+    t.updated = now.to_utc.to_rfc3339
+    Loser::Paths.write_atomic(path, render_task(t))
+    remember(path)
+    nil
+  end
+
+  # Local task: remove the file. GitHub task: keep it, hidden, so sync does not bring it back.
+  # A task the store does not know is ignored.
+  pub def delete(t : Task) : Nil
+    return unless @paths.has_key?(t.id)
+    if t.github?
+      t.hidden = true
+      save(t)
+      return
+    end
+    path = @paths[t.id]
+    File.delete(path) if File.exists?(path)
+    forget(t.id)
+  end
+
+  pub def search(key : String?, status : String?, query : String?) : Array(Task)
+    keys = key ? [key] : @projects.map { |p| p.key }
+    q = query ? fold(query) : nil
+    out_list = [] of Task
+    keys.each do |k|
+      tasks(k).each do |t|
+        next if status && t.status != status
+        next if q && !fold(t.title).includes?(q) && !fold(t.notes).includes?(q)
+        out_list << t
+      end
+    end
+    out_list
+  end
+
+  # The project, or the reason it could not be added.
+  pub def add_project(name : String, repo : String?) : Project | String
+    return "projects.toml has entries loser cannot read, not touching it" if @projects_broken
+    return "name is empty" if name.strip.empty?
+    if r = repo
+      return "invalid repo " + r.inspect + ", expected owner/name" unless valid_repo?(r)
+    end
+    p = Project.new(derive_key(name, @projects.map { |q| q.key }), name)
+    p.repo = repo
+    list = @projects.dup
+    list << p
+    save_projects(@root, list)
+    @projects = list
+    p
+  end
+
+  # Re-reads one task file; nil when it is gone, broken, outside the root or not a task file.
+  # A task whose file is gone or unreadable is forgotten.
+  pub def reload_file(path : String) : Task?
+    p = canon(path) || return nil
+    rest = p[(@root.bytesize + 1)...p.bytesize]
+    parts = rest.split("/")
+    return nil unless parts.size == 2
+    key = parts[0]
+    name = parts[1]
+    return nil if ignored_file?(name)
+    return nil unless @projects.any? { |q| q.key == key }
+    old_id : String? = nil
+    @paths.each { |id, pth| old_id = id if pth == p }
+    if oid = old_id
+      forget(oid)
+    end
+    # shortcut: an editor's delete-then-rename can remove the file between this check and the read, which panics; iyi has no non-raising File.read.
+    unless File.exists?(p)
+      @errors.delete(key + "/" + name)
+      return nil
+    end
+    read_into(key, p)
+  end
+
+  # The modification time the store last saw or wrote, in nanoseconds.
+  pub def mtime(path : String) : Int64?
+    p = canon(path) || return nil
+    @mtimes[p]?
+  end
+
+  # path spelled the way the store keys it, or nil when it is not under the root.
+  # The drive letter of a Windows root compares without case.
+  def canon(path : String) : String?
+    p = clean_path(File.expand_path(clean_path(path)))
+    prefix = @root + "/"
+    return nil if p.bytesize <= prefix.bytesize
+    head = p[0, prefix.bytesize]
+    same = head == prefix || (@root.bytesize > 1 && @root.chars[1] == ':' && head.downcase == prefix.downcase)
+    return nil unless same
+    @root + "/" + p[prefix.bytesize, p.bytesize]
+  end
+
+  def project_key_of_id(id : String) : String?
+    best : String? = nil
+    @projects.each do |p|
+      if id.starts_with?(p.key + "-") && p.key.bytesize > (best || "").bytesize
+        best = p.key
+      end
+    end
+    best
+  end
+
+  def register(t : Task, key : String, path : String) : Nil
+    @tasks = @tasks.reject { |x| x.id == t.id }
+    @tasks << t
+    @keys[t.id] = key
+    @paths[t.id] = path
+  end
+
+  def remember(path : String) : Nil
+    if m = mtime_ns(path)
+      @mtimes[path] = m
+    end
+  end
+
+  def forget(id : String) : Nil
+    if path = @paths[id]?
+      @mtimes.delete(path)
+    end
+    @tasks = @tasks.reject { |t| t.id == id }
+    @keys.delete(id)
+    @paths.delete(id)
+  end
+
+  # Parses one file into the list; a file that cannot be read goes to errors and nowhere else.
+  def read_into(key : String, path : String) : Task?
+    rel = key + "/" + File.basename(path)
+    @errors.delete(rel)
+    seen = mtime_ns(path)   # before the read, so a write landing in between is not recorded as seen
+    t = parse_task(File.read(path))
+    if t.nil? || @keys.has_key?(t.id)
+      @errors << rel
+      return nil
+    end
+    register(t, key, path)
+    if m = seen
+      @mtimes[path] = m
+    end
+    t
+  end
+end
