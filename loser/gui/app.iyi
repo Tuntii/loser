@@ -17,7 +17,7 @@ import github.com/tuntii/kilim/kilim/list_view::{ListView, ListRow}
 import github.com/tuntii/kilim/kilim/dropdown::{Dropdown}
 import github.com/tuntii/kilim/kilim/event::{Key, Mods, KeyDown}
 import github.com/tuntii/kilim/kilim/window::{Window}
-import loser/store::{Store, file_stamp}
+import loser/store::{Store}
 import loser/task::{Task, STATUSES, status_title, parse_task}
 import loser/projects::{Project}
 import loser/changes::{changed_paths, merge, write_conflict, WriteError}
@@ -349,12 +349,13 @@ pub class App
     end
   end
 
-  # Before a save: the task's file changed or vanished since the store last saw it. Status and
-  # labels take the outside value, title and notes are merged (Loser::Changes.merge); text that
-  # cannot be merged is kept in a conflict file. Answers what the status line should say.
+  # Before every save: the task's file is read again, whatever its stamp says (a write in the same
+  # second with the same size has the old stamp). Three-way, t being what the store last read or
+  # wrote: a field takes the outside value only where the outside changed it and I did not; title
+  # and notes are merged (Loser::Changes.merge). Text that cannot be merged is kept in a conflict
+  # file. A field keeping my value is left alone. Answers what the status line should say.
   def take_outside(t : Task) : String?
     path = @store.path_of(t)
-    return nil if file_stamp(path) == @store.stamp(path)
     return "\"" + t.title + "\" was deleted outside; saved your text again" unless File.exists?(path)
     text = File.read(path)
     conflict = true
@@ -364,13 +365,28 @@ pub class App
       conflict = m.conflict
       t.title = m.title
       t.notes = m.notes
+      @title.text = m.title unless t.github? || @title.text == m.title
+      @title_ro.text = m.title
+      @notes.text = m.notes unless @notes.text == m.notes
+      mine_status = STATUSES[@status.selected]
+      if o.status != t.status && mine_status == t.status
+        @status.selected = STATUSES.index(o.status) || 0
+      end
+      mine_labels = t.github? ? t.labels : @labels.text.split(",").map(&.strip).reject(&.empty?)
+      if o.labels != t.labels
+        if mine_labels == t.labels
+          @labels.text = o.labels.join(", ")
+          @labels_ro.text = o.labels.join(", ")
+        elsif o.labels != mine_labels
+          conflict = true   # both rewrote the labels: mine stay, theirs go to the conflict file
+        end
+      end
       t.status = o.status
       t.labels = o.labels
       t.github = o.github
       t.github_kind = o.github_kind
       t.github_state = o.github_state
       t.hidden = o.hidden
-      show_task
     end
     return nil unless conflict
     kept = write_conflict(@store, text, t.id, Time.utc)
