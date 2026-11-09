@@ -1,0 +1,137 @@
+# Read-only GitHub: issues and pull requests through `gh`, mapped onto task files.
+
+module loser/github
+
+import std/json::{JSON, Any}
+import std/process::{Process, ProcessResult, ProcessError}
+import std/file::{File}
+import loser/store::{Store}
+import loser/projects::{Project}
+import loser/task::{Task}
+
+pub struct Issue
+  getter number : Int64, title : String, labels : Array(String),
+         state : String,   # "open" | "closed" | "merged"
+         kind : String     # "issue" | "pr"
+
+  def initialize(@number : Int64, @title : String, @labels : Array(String), @state : String, @kind : String)
+  end
+end
+
+FILTER = ".[] | {number, title, state, labels: [.labels[].name], pr: (.pull_request != null), merged: (.pull_request.merged_at != null)}"
+
+# One Issue per line of gh's output; the second value counts the lines that were not an issue.
+pub def parse_lines(ndjson : String) : {Array(Issue), Int32}
+  out_list = [] of Issue
+  skipped = 0
+  ndjson.split("\n").each do |line|
+    next if line.strip.empty?
+    one = parse_line(line)
+    if one
+      out_list << one
+    else
+      skipped += 1
+    end
+  end
+  {out_list, skipped}
+end
+
+pub def parse_issues(ndjson : String) : Array(Issue)
+  parse_lines(ndjson)[0]
+end
+
+def field(doc : Any, key : String) : Any?
+  doc.as_h? || return nil
+  doc[key]?
+end
+
+def parse_line(line : String) : Issue?
+  doc = JSON.parse?(line) || return nil
+  number = (field(doc, "number") || return nil).as_i? || return nil
+  title = (field(doc, "title") || return nil).as_s? || return nil
+  state = (field(doc, "state") || return nil).as_s? || return nil
+  names = (field(doc, "labels") || return nil).as_a? || return nil
+  pr = false
+  if v = field(doc, "pr")
+    pr = v.as_bool? || false
+  end
+  merged = false
+  if v = field(doc, "merged")
+    merged = v.as_bool? || false
+  end
+  labels = [] of String
+  names.each do |n|
+    if s = n.as_s?
+      labels << s
+    end
+  end
+  state = "merged" if merged && state == "closed"
+  Issue.new(number, title, labels, state, pr ? "pr" : "issue")
+end
+
+# Open items on the first sync, everything touched since afterwards. A String is the text for the status line.
+pub def gh_issues(repo : String, since : String?) : Array(Issue) | String
+  query = "state=open"
+  if s = since
+    query = "state=all&since=" + s
+  end
+  r = Process.run("gh", ["api", "--paginate", "repos/" + repo + "/issues?per_page=100&" + query, "--jq", FILTER])
+  return "GitHub: gh is not installed" if r.is_a?(ProcessError)
+  return "GitHub: gh was cancelled" unless r.is_a?(ProcessResult)
+  unless r.success?
+    return "GitHub: not logged in (run gh auth login)" if r.stderr.includes?("auth login")
+    first = (r.stderr.split("\n").first? || "").strip
+    return "GitHub: " + (first.empty? ? "gh failed with exit code " + r.exit_code.to_s : first)
+  end
+  parsed = parse_lines(r.stdout)
+  return "GitHub: gh answered something loser cannot read" if parsed[0].empty? && parsed[1] > 0
+  parsed[0]
+end
+
+def done_state?(s : String?) : Bool
+  s == "closed" || s == "merged"
+end
+
+# "created" | "updated" | "unchanged" | "skipped". Writes only through the store and never touches the notes.
+pub def apply_issue(store : Store, p : Project, i : Issue) : String
+  repo = p.repo || return "skipped"
+  id = p.key + "-" + i.number.to_s
+  path = store.root + "/" + p.key + "/" + id + ".md"
+  ref = repo + "#" + i.number.to_s
+  # a GUI save a moment ago counts: read the file again before deciding
+  t = store.reload_file(path)
+  if t.nil?
+    return "skipped" if File.exists?(path)   # present but unreadable: never overwrite
+    return "skipped" unless i.state == "open"
+    n = Task.new(id, i.title)
+    n.labels = i.labels
+    n.github = ref
+    n.github_kind = i.kind
+    n.github_state = i.state
+    # shortcut: save finds the project from the id prefix, so a project key that is another key plus "-<digits>" could clash; upgrade if keys get restricted.
+    return store.save(n) ? "skipped" : "created"
+  end
+  changed = false
+  if t.title != i.title || t.labels != i.labels || t.github != ref || t.github_kind != i.kind
+    t.title = i.title
+    t.labels = i.labels
+    t.github = ref
+    t.github_kind = i.kind
+    changed = true
+  end
+  if done_state?(i.state)
+    if t.status != "done"
+      t.status = "done"
+      changed = true
+    end
+  elsif done_state?(t.github_state) && t.status == "done"
+    t.status = "todo"
+    changed = true
+  end
+  if t.github_state != i.state
+    t.github_state = i.state
+    changed = true
+  end
+  return "unchanged" unless changed
+  store.save(t) ? "skipped" : "updated"
+end

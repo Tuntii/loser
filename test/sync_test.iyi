@@ -1,0 +1,63 @@
+module test/sync_test
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/time::{Time, Span}
+import loser/store
+import loser/github
+import loser/sync
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def seed(name : String) : String
+  root = Loser::Testkit.temp_root(name)
+  st = Loser::Store::Store.new(root)
+  st.add_project("Kilim", "Tuntii/kilim")
+  st.add_project("Notes", nil)
+  root
+end
+
+def main : Int32
+  data = Loser::Github.parse_issues(File.read("test/fixtures/issues.ndjson"))
+  seen = [] of String
+  ok = ->(repo : String, since : String?) : Array(Loser::Github::Issue) | String {
+    seen << repo + "|" + (since || "-")
+    data
+  }
+  root = seed("sync_ok")
+  expect_eq(Loser::Sync.run_sync(root, nil, ok), "GitHub: 2 new, 0 updated", "summary")
+  expect_eq(seen, ["Tuntii/kilim|-"], "only the linked project, first sync without since")
+  expect(File.exists?(root + "/kilim/kilim-1.md"), "task file written")
+  expect(File.exists?(root + "/.sync-state.toml"), "state written")
+  expect(!Dir.exists?(root + "/.sync.lock"), "lock released")
+  expect_eq(Loser::Sync.run_sync(root, nil, ok), "GitHub: 0 new, 0 updated", "second sync")
+  expect(seen[1].starts_with?("Tuntii/kilim|20"), "second sync passes since")
+
+  # nothing linked
+  r0 = Loser::Testkit.temp_root("sync_none")
+  Loser::Store::Store.new(r0).add_project("Notes", nil)
+  expect_eq(Loser::Sync.run_sync(r0, nil, ok), "GitHub: no project is linked to a repo", "nothing linked")
+
+  # a failure changes nothing and frees the lock
+  bad = ->(repo : String, since : String?) : Array(Loser::Github::Issue) | String { "GitHub: not logged in (run gh auth login)" }
+  r2 = seed("sync_bad")
+  expect_eq(Loser::Sync.run_sync(r2, nil, bad), "GitHub: not logged in (run gh auth login)", "error text")
+  expect(!File.exists?(r2 + "/kilim/kilim-1.md"), "no task written")
+  expect(!File.exists?(r2 + "/.sync-state.toml"), "no state written")
+  expect(!Dir.exists?(r2 + "/.sync.lock"), "lock released after failure")
+
+  # a held lock
+  r3 = seed("sync_locked")
+  Dir.mkdir(r3 + "/.sync.lock")
+  File.write(r3 + "/.sync.lock/owner", "1234 " + Time.utc.to_rfc3339)
+  expect_eq(Loser::Sync.run_sync(r3, nil, ok), "GitHub: another sync is running", "fresh lock")
+  expect(Dir.exists?(r3 + "/.sync.lock"), "foreign lock left alone")
+
+  # a stale lock
+  File.write(r3 + "/.sync.lock/owner", "1234 " + (Time.utc - Span.new(minutes: 11_i64)).to_rfc3339)
+  expect_eq(Loser::Sync.run_sync(r3, nil, ok), "GitHub: 2 new, 0 updated", "stale lock replaced")
+  expect(!Dir.exists?(r3 + "/.sync.lock"), "lock released")
+  0
+end
+
+exit main

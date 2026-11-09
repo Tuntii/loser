@@ -1,0 +1,107 @@
+module test/github_test
+
+import std/file::{File}
+import std/dir::{Dir}
+import loser/store
+import loser/projects
+import loser/task
+import loser/github
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def fixture : String
+  File.read("test/fixtures/issues.ndjson")
+end
+
+def setup(name : String) : {Loser::Store::Store, Loser::Projects::Project}
+  root = Loser::Testkit.temp_root(name)
+  st = Loser::Store::Store.new(root)
+  p = st.add_project("Kilim", "Tuntii/kilim")
+  raise "add_project" if p.is_a?(String)
+  {st, p}
+end
+
+def issue(n : Int64, title : String, state : String, kind : String = "issue") : Loser::Github::Issue
+  Loser::Github::Issue.new(n, title, ["bug"], state, kind)
+end
+
+def task(st : Loser::Store::Store, id : String) : Loser::Task::Task
+  st.find(id) || raise "no task " + id
+end
+
+def main : Int32
+  # parse_issues: kinds and states; junk lines are skipped
+  is = Loser::Github.parse_issues(fixture)
+  expect_eq(is.size, 4, "four issues")
+  expect_eq(is[0].kind, "issue", "1 is an issue")
+  expect_eq(is[0].labels, ["bug", "help wanted"], "labels")
+  expect_eq(is[1].kind, "pr", "2 is a pr")
+  expect_eq(is[2].state, "closed", "3 closed")
+  expect_eq(is[3].state, "merged", "4 merged")
+  expect_eq(is[3].kind, "pr", "4 pr")
+  junk = Loser::Github.parse_issues("not json\n{\"number\":5}\n\n[1]\n{\"number\":6,\"title\":\"ok\",\"state\":\"open\",\"labels\":[],\"pr\":false,\"merged\":false}\n")
+  expect_eq(junk.size, 1, "bad lines skipped")
+  expect_eq(junk[0].number, 6_i64, "the good line stays")
+
+  # empty store: 1 and 2 created in todo, 3 and 4 skipped
+  st, p = setup("github_create")
+  res = is.map { |i| Loser::Github.apply_issue(st, p, i) }
+  expect_eq(res, ["created", "created", "skipped", "skipped"], "create results")
+  t1 = task(st, "kilim-1")
+  expect_eq(t1.status, "todo", "new task in todo")
+  expect_eq(t1.github, "Tuntii/kilim#1", "github ref")
+  expect_eq(t1.github_kind, "issue", "kind")
+  expect_eq(t1.github_state, "open", "state")
+  expect(st.find("kilim-3").nil?, "closed issue not created")
+  expect_eq(Loser::Github.apply_issue(st, p, is[0]), "unchanged", "same issue again")
+
+  # doing stays doing, title follows, notes byte-equal
+  t1.status = "doing"
+  t1.notes = "my notes\n---\nçağ"
+  st.save(t1)
+  expect_eq(Loser::Github.apply_issue(st, p, issue(1_i64, "New title", "open")), "updated", "title change")
+  t1 = task(st, "kilim-1")
+  expect_eq(t1.title, "New title", "title follows")
+  expect_eq(t1.status, "doing", "doing stays")
+  expect_eq(t1.notes, "my notes\n---\nçağ", "notes untouched")
+
+  # closed -> done, reopened -> todo
+  expect_eq(Loser::Github.apply_issue(st, p, issue(1_i64, "New title", "closed")), "updated", "closed")
+  expect_eq(task(st, "kilim-1").status, "done", "closed moves to done")
+  expect_eq(Loser::Github.apply_issue(st, p, issue(1_i64, "New title", "open")), "updated", "reopened")
+  expect_eq(task(st, "kilim-1").status, "todo", "reopened moves to todo")
+
+  # a save by someone else a moment earlier is kept
+  other = Loser::Store::Store.new(st.root)
+  other.load
+  o = task(other, "kilim-1")
+  o.notes = "typed in the GUI"
+  other.save(o)
+  Loser::Github.apply_issue(st, p, issue(1_i64, "Third title", "open"))
+  expect_eq(task(st, "kilim-1").notes, "typed in the GUI", "gui notes kept")
+
+  # hidden stays hidden
+  t2 = task(st, "kilim-2")
+  t2.hidden = true
+  st.save(t2)
+  expect_eq(Loser::Github.apply_issue(st, p, issue(2_i64, "Renamed PR", "open", "pr")), "updated", "hidden task updated")
+  expect(task(st, "kilim-2").hidden, "still hidden")
+
+  # unchanged writes nothing
+  path2 = st.path_of(task(st, "kilim-2"))
+  before = File.read(path2)
+  stamp = st.stamp(path2)
+  expect_eq(Loser::Github.apply_issue(st, p, issue(2_i64, "Renamed PR", "open", "pr")), "unchanged", "unchanged")
+  expect_eq(File.read(path2), before, "file bytes unchanged")
+  expect_eq(st.stamp(path2), stamp, "stamp unchanged")
+
+  # a broken file at the task's path is never overwritten
+  st3, p3 = setup("github_broken")
+  Dir.mkdir_p(st3.root + "/kilim")
+  File.write(st3.root + "/kilim/kilim-7.md", "no front matter")
+  expect_eq(Loser::Github.apply_issue(st3, p3, issue(7_i64, "x", "open")), "skipped", "broken file skipped")
+  expect_eq(File.read(st3.root + "/kilim/kilim-7.md"), "no front matter", "broken file kept")
+  0
+end
+
+exit main
