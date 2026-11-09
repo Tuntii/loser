@@ -100,3 +100,35 @@ jobs:
           name: loser-${{ matrix.os }}
           path: loser.bmp
           if-no-files-found: warn
+
+  release:
+    name: release
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install iyi
+        shell: pwsh
+        run: |
+          irm https://raw.githubusercontent.com/iyilang/iyi/v$env:IYI_VERSION/install.ps1 | iex
+          "$env:LOCALAPPDATA\Programs\iyi\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: MSVC dev shell
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Build loser.exe
+        run: iyi build --release main.iyi -o loser.exe
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx --yes -p semantic-release@24 -p conventional-changelog-conventionalcommits@8 semantic-release
