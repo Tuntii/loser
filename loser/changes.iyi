@@ -1,0 +1,110 @@
+# Outside changes: scan (worker side, no Store), diff against the store, merge text.
+
+module loser/changes
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/time::{Time}
+import loser/paths
+import loser/store::{Store, file_stamp, clean_path, ignored_file?}
+
+pub struct Merge
+  getter title : String, notes : String, conflict : Bool
+
+  def initialize(@title : String, @notes : String, @conflict : Bool)
+  end
+end
+
+pub struct WriteError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+# One line "<path>\t<mtime ns>\t<size>" for projects.toml and every <folder>/*.md of the root,
+# sorted by path. Plain files and directories only, no C calls: safe inside spawn_parallel.
+# Folders that are not projects are listed too; changed_paths ignores them.
+pub def scan(root : String) : String
+  r = clean_path(root)
+  files = [] of String
+  files << r + "/projects.toml"
+  if Dir.exists?(r)
+    Dir.children(r).each do |d|
+      dir = r + "/" + d
+      next unless Dir.exists?(dir)
+      Dir.children(dir).each do |name|
+        files << dir + "/" + name unless ignored_file?(name)
+      end
+    end
+  end
+  out = String.build do |s|
+    files.sorted.each do |p|
+      if st = file_stamp(p)
+        s << p << "\t" << st[0] << "\t" << st[1] << "\n"
+      end
+    end
+  end
+  out
+end
+
+# Paths (as the store spells them) whose {mtime, size} differ from what the store saw or wrote,
+# new task files of known projects, and stamped paths that are gone.
+pub def changed_paths(store : Store, scanned : String) : Array(String)
+  seen = Hash(String, Bool).new
+  out = [] of String
+  scanned.split("\n").each do |line|
+    parts = line.split("\t")
+    next unless parts.size == 3
+    p = store.canon(parts[0]) || next
+    stamp = {parts[1].to_i64? || -1_i64, parts[2].to_i64? || -1_i64}
+    seen[p] = true
+    known = store.stamp(p)
+    if known.nil?
+      out << p if tracked?(store, p)
+    elsif known != stamp
+      out << p
+    end
+  end
+  store.stamped_paths.each { |p| out << p unless seen.has_key?(p) }
+  out.sorted
+end
+
+def tracked?(store : Store, p : String) : Bool
+  return true if p == store.root + "/projects.toml"
+  rest = p[(store.root.bytesize + 1)...p.bytesize].split("/")
+  rest.size == 2 && store.projects.any? { |q| q.key == rest[0] }
+end
+
+# base = what was last saved. Text is never dropped: when both sides edited the same field,
+# mine wins and the caller keeps the outside version with write_conflict.
+pub def merge(base_title : String, base_notes : String,
+              mine_title : String, mine_notes : String,
+              outside_title : String, outside_notes : String) : Merge
+  title = merge_title(base_title, mine_title, outside_title)
+  if outside_notes == base_notes
+    return Merge.new(title[0], mine_notes, title[1])
+  end
+  if outside_notes.starts_with?(base_notes) && mine_notes != base_notes
+    return Merge.new(title[0], mine_notes + outside_notes[base_notes.bytesize, outside_notes.bytesize - base_notes.bytesize], title[1])
+  end
+  if mine_notes == base_notes
+    return Merge.new(title[0], outside_notes, title[1])
+  end
+  Merge.new(title[0], mine_notes, true)
+end
+
+def merge_title(base : String, mine : String, outside : String) : {String, Bool}
+  return {mine, false} if outside == base || outside == mine
+  return {outside, false} if mine == base
+  {mine, true}
+end
+
+# Writes <project folder>/<id>.conflict-<yyyymmddhhmmss>.md (UTC) and answers its path.
+# shortcut: a failing disk write still panics (iyi has no non-raising File.write); only an unknown task is an error value.
+pub def write_conflict(store : Store, outside_text : String, id : String, now : Time) : String | WriteError
+  t = store.find(id) || return WriteError.new("unknown task " + id)
+  path = File.dirname(store.path_of(t)) + "/" + id + ".conflict-" + now.to_utc.to_s("%Y%m%d%H%M%S") + ".md"
+  Loser::Paths.write_atomic(path, outside_text)
+  path
+end

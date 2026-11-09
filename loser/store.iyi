@@ -19,6 +19,13 @@ pub def mtime_ns(path : String) : Int64?
   info.modification_time * 1000000000_i64
 end
 
+# What a file looks like right now: {mtime ns, size in bytes}; nil when it is missing.
+# shortcut: a write in the same second with the same size looks like no change; upgrade when std grows sub-second times.
+pub def file_stamp(path : String) : {Int64, Int64}?
+  info = File.info?(path) || return nil
+  {info.modification_time * 1000000000_i64, info.size}
+end
+
 def valid_key?(k : String) : Bool
   return false if k.empty?
   k.chars.each_with_index do |c, i|
@@ -28,12 +35,12 @@ def valid_key?(k : String) : Bool
   true
 end
 
-def ignored_file?(name : String) : Bool
+pub def ignored_file?(name : String) : Bool
   !name.ends_with?(".md") || name.includes?(".conflict-")
 end
 
 # Forward slashes, no trailing slash.
-def clean_path(p : String) : String
+pub def clean_path(p : String) : String
   s = p.gsub("\\", "/")
   while s.bytesize > 1 && s.ends_with?("/")
     s = s.chomp("/")
@@ -71,7 +78,7 @@ pub class Store
     @tasks = [] of Task
     @keys = Hash(String, String).new   # task id -> project key
     @paths = Hash(String, String).new  # task id -> file path
-    @mtimes = Hash(String, Int64).new
+    @stamps = Hash(String, {Int64, Int64}).new
     @projects_broken = false
   end
 
@@ -87,8 +94,9 @@ pub class Store
     @tasks = [] of Task
     @keys = Hash(String, String).new
     @paths = Hash(String, String).new
-    @mtimes = Hash(String, Int64).new
+    @stamps = Hash(String, {Int64, Int64}).new
     @projects_broken = false
+    remember(@root + "/projects.toml")  # before the read
     loaded = load_projects(@root)
     if loaded.is_a?(String)
       @projects_broken = true
@@ -237,6 +245,7 @@ pub class Store
     list = @projects.dup
     list << p
     save_projects(@root, list)
+    remember(@root + "/projects.toml")
     @projects = list
     p
   end
@@ -268,12 +277,26 @@ pub class Store
   # The modification time the store last saw or wrote, in nanoseconds.
   pub def mtime(path : String) : Int64?
     p = canon(path) || return nil
-    @mtimes[p]?
+    if s = @stamps[p]?
+      return s[0]
+    end
+    nil
+  end
+
+  # The {mtime ns, size} the store last saw or wrote.
+  pub def stamp(path : String) : {Int64, Int64}?
+    p = canon(path) || return nil
+    @stamps[p]?
+  end
+
+  # Every file the store holds a stamp for: task files and projects.toml.
+  pub def stamped_paths : Array(String)
+    @stamps.keys
   end
 
   # path spelled the way the store keys it, or nil when it is not under the root.
   # The drive letter of a Windows root compares without case.
-  def canon(path : String) : String?
+  pub def canon(path : String) : String?
     p = clean_path(File.expand_path(clean_path(path)))
     prefix = @root + "/"
     return nil if p.bytesize <= prefix.bytesize
@@ -301,14 +324,14 @@ pub class Store
   end
 
   def remember(path : String) : Nil
-    if m = mtime_ns(path)
-      @mtimes[path] = m
+    if m = file_stamp(path)
+      @stamps[path] = m
     end
   end
 
   def forget(id : String) : Nil
     if path = @paths[id]?
-      @mtimes.delete(path)
+      @stamps.delete(path)
     end
     @tasks = @tasks.reject { |t| t.id == id }
     @keys.delete(id)
@@ -319,7 +342,7 @@ pub class Store
   def read_into(key : String, path : String) : Task?
     rel = key + "/" + File.basename(path)
     @errors.delete(rel)
-    seen = mtime_ns(path)   # before the read, so a write landing in between is not recorded as seen
+    seen = file_stamp(path)   # before the read, so a write landing in between is not recorded as seen
     t = parse_task(File.read(path))
     if t.nil? || @keys.has_key?(t.id)
       @errors << rel
@@ -327,7 +350,7 @@ pub class Store
     end
     register(t, key, path)
     if m = seen
-      @mtimes[path] = m
+      @stamps[path] = m
     end
     t
   end
