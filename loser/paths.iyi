@@ -1,0 +1,26 @@
+# Root folder and atomic writes.
+
+module loser/paths
+
+import std/env::{ENV}
+import std/file::{File}
+import std/dir::{Dir}
+
+# LOSER_HOME, else %USERPROFILE%\loser on Windows, else ~/loser. Created when missing.
+pub def root : String
+  home = ENV["LOSER_HOME"]?
+  if home.nil? || home.empty?
+    base = ENV["USERPROFILE"]? || ENV["HOME"]? || raise("no home folder")
+    home = base + "/loser"
+  end
+  Dir.mkdir_p(home)
+  home
+end
+
+# Writes path + ".tmp", then renames it over path. Creates the parent folder.
+pub def write_atomic(path : String, text : String) : Nil
+  Dir.mkdir_p(File.dirname(path))
+  tmp = path + ".tmp"
+  File.write(tmp, text)
+  File.rename(tmp, path)
+end

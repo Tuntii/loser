@@ -1,0 +1,15 @@
+# Test helper: a fresh empty folder per test.
+
+module loser/testkit
+
+import std/env::{ENV}
+import std/dir::{Dir}
+import std/file_utils::{FileUtils}
+
+pub def temp_root(name : String) : String
+  base = ENV["TEMP"]? || ENV["TMPDIR"]? || "/tmp"
+  dir = base + "/loser_test_" + name
+  FileUtils.rm_rf(dir) if Dir.exists?(dir)
+  Dir.mkdir_p(dir)
+  dir
+end

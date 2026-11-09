@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IYI_VERSION: 0.20.0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install iyi (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://raw.githubusercontent.com/iyilang/iyi/v$env:IYI_VERSION/install.ps1 | iex
+          "$env:LOCALAPPDATA\Programs\iyi\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Install iyi (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/iyilang/iyi/v$IYI_VERSION/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Module files are tidy
+        run: iyi mod tidy --check
+      - name: Test
+        run: iyi test

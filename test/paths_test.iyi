@@ -1,0 +1,29 @@
+module test/paths_test
+
+import std/env::{ENV}
+import std/file::{File}
+import std/dir::{Dir}
+import loser/paths
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def main : Int32
+  home = Loser::Testkit.temp_root("paths_root")
+  ENV["LOSER_HOME"] = home + "/nested"
+  expect_eq(Loser::Paths.root, home + "/nested", "root is LOSER_HOME")
+  expect(Dir.exists?(home + "/nested"), "root folder created")
+
+  dir = Loser::Testkit.temp_root("paths_write")
+  p = dir + "/a.md"
+  Loser::Paths.write_atomic(p, "a")
+  Loser::Paths.write_atomic(p, "b")
+  expect_eq(File.read(p), "b", "second write replaces the first")
+  expect(!File.exists?(p + ".tmp"), "no tmp file left")
+
+  q = dir + "/sub/deeper/x.md"
+  Loser::Paths.write_atomic(q, "x")
+  expect_eq(File.read(q), "x", "missing parent created")
+  0
+end
+
+exit main
