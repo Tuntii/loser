@@ -41,13 +41,27 @@ def main : Int32
   expect_eq(s.notes, "Notes, as plain Markdown text.\n", "sample notes")
   expect_eq(s.updated, "2026-11-06T10:00:00Z", "sample updated")
 
-  crlf = Loser::Task.parse_task("﻿" + SAMPLE.gsub("\n", "\r\n")) || raise("crlf is nil")
+  crlf = Loser::Task.parse_task("\uFEFF" + SAMPLE.gsub("\n", "\r\n")) || raise("crlf is nil")
   expect_eq(Loser::Task.render_task(crlf), Loser::Task.render_task(s), "CRLF and BOM read the same")
 
   b = Loser::Task.parse_task("---\nid: a\ntitle: b\nstatus: blocked\n---\n") || raise("blocked is nil")
   expect_eq(b.status, "todo", "unknown status is todo")
   expect_eq(b.updated, "", "missing updated is empty")
   expect_eq(b.hidden, false, "missing hidden")
+
+  n = Loser::Task.parse_task("---\nid: 12\ntitle: 2024\nlabels: [2024, docs]\nstatus: 5\n---\n") || raise("numeric is nil")
+  expect_eq(n.id, "12", "numeric id")
+  expect_eq(n.title, "2024", "numeric title")
+  expect_eq(n.labels, ["2024", "docs"], "numeric label")
+  expect_eq(n.status, "todo", "numeric status")
+  expect_eq((Loser::Task.parse_task("---\nid: a\ntitle: true\n---\n") || raise("bool")).title, "true", "bool title")
+  expect_eq((Loser::Task.parse_task("---\nid: a\ntitle: 3.5\n---\n") || raise("float")).title, "3.5", "float title")
+  expect_eq((Loser::Task.parse_task("---\nid: a\ntitle: b\nlabels: docs\n---\n") || raise("scalar labels")).labels, ["docs"], "scalar labels")
+  ["a\nb", ""].each do |notes|
+    r = Loser::Task::Task.new("k-2", "T")
+    r.notes = notes
+    expect_eq((Loser::Task.parse_task(Loser::Task.render_task(r)) || raise("rt")).notes, notes, "notes round trip " + notes.inspect)
+  end
 
   expect(Loser::Task.parse_task("---\nid: a\ntitle: b\n").nil?, "no closing ---")
   expect(Loser::Task.parse_task("---\nid: a\ntitle: [\n---\n").nil?, "invalid yaml")

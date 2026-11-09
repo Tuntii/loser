@@ -38,7 +38,7 @@ end
 
 # nil when the text has no readable front matter or lacks id or title.
 pub def parse_task(text : String) : Task?
-  text = text[3, text.bytesize] if text.starts_with?("﻿")
+  text = text[3, text.bytesize] if text.starts_with?("\uFEFF")
   lines = text.gsub("\r\n", "\n").split("\n")
   return nil unless lines[0] == "---"
   close = 1
@@ -54,8 +54,12 @@ pub def parse_task(text : String) : Task?
   t = Task.new(id, title)
   st = field_s(doc, "status") || "todo"
   t.status = STATUSES.includes?(st) ? st : "todo"
-  if labels = (doc["labels"]? && doc["labels"].as_a?)
-    labels.each { |l| (s = l.as_s?) && t.labels << s }
+  if lv = doc["labels"]?
+    if arr = lv.as_a?
+      arr.each { |l| (s = scalar_s(l)) && t.labels << s }
+    elsif s = scalar_s(lv)
+      t.labels << s
+    end
   end
   t.github = field_s(doc, "github")
   t.github_kind = field_s(doc, "github_kind")
@@ -86,8 +90,21 @@ pub def render_task(t : Task) : String
   s + "---\n" + t.notes
 end
 
+# A scalar read as text: strings as they are, numbers and booleans by their value.
+def scalar_s(v : Any) : String?
+  if s = v.as_s?
+    s
+  elsif i = v.as_i?
+    i.to_s
+  elsif f = v.as_f?
+    f.to_s
+  elsif b = v.as_bool?
+    b.to_s
+  end
+end
+
 def field_s(doc : Any, key : String) : String?
   if v = doc[key]?
-    v.as_s?
+    scalar_s(v)
   end
 end
