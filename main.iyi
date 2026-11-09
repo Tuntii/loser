@@ -9,7 +9,8 @@ import loser/sync
 import loser/testkit
 import loser/changes
 import loser/store::{Store}
-import loser/task::{Task}
+import loser/task::{Task, render_task}
+import std/time::{Time}
 import loser/gui/app::{App}
 import loser/gui/forms::{new_project_form}
 import github.com/tuntii/kilim
@@ -219,7 +220,22 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   ctrl(win, Key::F)
   fail("search not focused after Ctrl+F") unless win.ui.focused == app.search
   win.inject TextInput.new("spec")
-  fail("search rows: " + titles(app).inspect) unless titles(app) == ["Write the spec"]
+  # the selected task keeps its row even when it does not match
+  fail("search rows: " + titles(app).inspect) unless titles(app) == ["Plan the release", "Write the spec"]
+
+  # Editing the selected task until it stops matching keeps it selected, its editors and focus in place.
+  choose(win, app.tasks, id)
+  click(win, app.title)
+  ctrl(win, Key::A)
+  win.inject TextInput.new("Write the plan")
+  sleep(550)
+  win.step
+  fail("retitle not saved:\n" + file_of(id)) unless file_of(id).includes?("title: \"Write the plan\"")
+  fail("task deselected by the search") unless (ct = app.current_task) && ct.id == id
+  fail("editors gone under the search") unless app.title.attached_to?(app.root)
+  fail("focus left the title field") unless win.ui.focused == app.title
+
+  ctrl(win, Key::F)
   ctrl(win, Key::A)
   press(win, Key::Backspace)
   fail("rows after clearing the search: " + titles(app).inspect) unless titles(app).size == 4
@@ -323,6 +339,36 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   # A sync summary goes to the status line.
   app.on_message("sync\nGitHub: not logged in (run gh auth login)")
   fail("sync summary not shown: " + app.status_line.text.inspect) unless app.status_line.text == "GitHub: not logged in (run gh auth login)"
+
+  # A git pull of 200 new files plus the selected task: reloaded in slices across frames, the selected task first.
+  bw = row_key(app, "Build the window")
+  choose(win, app.tasks, bw)
+  200.times do |i|
+    t = Task.new("alpha-bulk" + (1000 + i).to_s, "Pulled " + i.to_s)
+    t.notes = "from a pull\n"
+    Loser::Paths.write_atomic(Loser::Paths.root + "/alpha/" + t.id + ".md", render_task(t))
+  end
+  Loser::Paths.write_atomic(task_path(bw), file_of(bw) + "\npulled too")
+  scanned = "scan\n" + Loser::Changes.scan(Loser::Paths.root)
+  t0 = Time.monotonic
+  app.on_message(scanned)
+  first = (Time.monotonic - t0).total_milliseconds
+  fail("selected task not in the first slice: " + app.notes.text.inspect) unless app.notes.text.ends_with?("\npulled too")
+  worst = 0.0
+  steps = 1
+  while app.pending?
+    fail("bulk reload never finished") if steps > 2000
+    sleep(2)
+    t1 = Time.monotonic
+    win.step
+    took = (Time.monotonic - t1).total_milliseconds
+    worst = took if took > worst
+    steps += 1
+  end
+  puts "200 outside files: first pass " + first.round(1).to_s + " ms, worst later frame " + worst.round(1).to_s + " ms, " + steps.to_s + " window steps"
+  # loose bounds so CI machines pass; the printed numbers are the measurement
+  fail("a reload pass took over 100 ms") if first > 100 || worst > 100
+  fail("200 pulled tasks not listed: " + titles(app).size.to_s) unless titles(app).size == 202
 
   win.step
   win.screenshot(bmp)

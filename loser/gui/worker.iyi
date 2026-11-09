@@ -35,6 +35,7 @@ pub class Worker
 
   pub def run : Nil
     tick = 0
+    last = ""
     until @stopped.get == 1
       asked = @wanted.swap(0) == 1
       if asked || (tick > 0 && tick % SYNC_TICKS == 0)
@@ -42,7 +43,12 @@ pub class Worker
         @inbox.send("sync-start")
         @inbox.send("sync\n" + Loser::Sync.run_sync(@root, only.is_a?(String) ? only : nil))
       end
-      @inbox.send("scan\n" + Loser::Changes.scan(@root)) if tick % SCAN_TICKS == 0
+      if tick % SCAN_TICKS == 0
+        # an unchanged root says nothing new: the UI's own writes change the scan too
+        s = Loser::Changes.scan(@root)
+        @inbox.send("scan\n" + s) unless s == last
+        last = s
+      end
       # a panic on the UI thread cancels the group: sleep then answers at once, so stop
       break if sleep(TICK_MS).is_a?(Cancelled)
       tick += 1

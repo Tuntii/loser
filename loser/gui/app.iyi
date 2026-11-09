@@ -24,6 +24,7 @@ import loser/changes::{changed_paths, merge, write_conflict, WriteError}
 import loser/gui/worker::{Worker}
 
 AUTOSAVE_MS = 500
+RELOAD_SLICE = 20
 
 # Closures built before the App is (text fields, buttons) reach it through this.
 class Hook
@@ -60,6 +61,11 @@ pub class App
   # Edits not on disk yet (a failed save keeps them).
   getter dirty : Bool
 
+  # Outside changes still to reload (spread over frames).
+  pub def pending? : Bool
+    !@pending.empty?
+  end
+
   def initialize(@store : Store)
     hook = Hook.new
     on_edit = ->(_s : String) { hook.run { |a| a.edited }; nil }
@@ -68,6 +74,8 @@ pub class App
     @dirty = false
     @timer = nil.as(Int32?)
     @worker = nil.as(Worker?)
+    @pending = [] of String
+    @reload_timer = nil.as(Int32?)
     @projects = Kilim.list_view
     @tasks = Kilim.list_view
     @search = Kilim.textbox("Search", on_change: ->(_s : String) { hook.run { |a| a.search_changed }; nil }, sizing: Kilim.fit)
@@ -171,7 +179,13 @@ pub class App
     rows = [] of ListRow
     if key = @project
       q = @search.text.strip
-      list = q.empty? ? @store.tasks(key) : @store.search(key, nil, q)
+      list = @store.tasks(key)
+      unless q.empty?
+        hits = Hash(String, Bool).new
+        @store.search(key, nil, q).each { |t| hits[t.id] = true }
+        # the selected task keeps its row: an edit that stops it matching must not take it away mid-typing
+        list = list.select { |t| t.id == @task || hits.has_key?(t.id) }
+      end
       STATUSES.each do |st|
         group = list.select { |t| t.status == st }
         rows << ListRow.new(status_title(st) + " (" + group.size.to_s + ")", "", true)
@@ -298,19 +312,41 @@ pub class App
     end
   end
 
-  # The worker's scan: reload what changed on disk since the store last saw it.
+  # The worker's scan: queue what changed on disk since the store last saw it, the task being edited first.
   def outside_changes(scan : String) : Nil
     paths = changed_paths(@store, scan)
     return if paths.empty?
+    @pending = (@pending + paths).uniq
+    if t = current_task
+      cur = @store.path_of(t)
+      @pending = [cur] + @pending.reject { |p| p == cur } if @pending.includes?(cur)
+    end
+    reload_pending if @reload_timer.nil?
+  end
+
+  # Reloads at most RELOAD_SLICE queued files, then lets a frame through before the next slice:
+  # a git pull of 200 files must not freeze typing (about 0.2 ms per file).
+  def reload_pending : Nil
+    @reload_timer = nil
+    return if @pending.empty?
+    n = @pending.size < RELOAD_SLICE ? @pending.size : RELOAD_SLICE
+    slice = @pending[0, n]
+    @pending = @pending[n, @pending.size - n]
     # Unsaved edits first: flush merges an outside change of their file, or writes it back if it is gone.
     flush if @dirty
     before = @store.errors
     cur = (t = current_task) ? @store.path_of(t) : nil
-    paths.each { |p| @store.reload_file(p) }
+    slice.each { |p| @store.reload_file(p) }
     refresh
-    show_task if cur && paths.includes?(cur)
+    show_task if cur && slice.includes?(cur)
     errs = @store.errors
     say("Could not read: " + errs.join(", ")) unless errs.empty? || errs == before
+    return if @pending.empty?
+    if w = @win
+      @reload_timer = w.after(1) { reload_pending }
+    else
+      reload_pending
+    end
   end
 
   # Before a save: the task's file changed or vanished since the store last saw it. Status and
