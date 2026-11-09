@@ -42,6 +42,9 @@ pub class App
   getter labels_ro : Label
   getter notes : TextArea
   getter status_line : Label
+  getter no_task : Label
+  # Edits not on disk yet (a failed save keeps them).
+  getter dirty : Bool
 
   def initialize(@store : Store)
     hook = Hook.new
@@ -67,9 +70,12 @@ pub class App
       padding: 8, spacing: 8, sizing: Kilim.fixed(220))
     middle = Kilim.column([@search, Kilim.scroll(@tasks), Kilim.button("New task")] of Widget,
       padding: 8, spacing: 8, sizing: Kilim.fixed(380))
-    right = Kilim.column([@title_slot, Kilim.row([@status] of Widget), @labels_slot, @notes, Kilim.row([Kilim.button("Delete")] of Widget)] of Widget,
-      padding: 8, spacing: 8, sizing: Kilim.fill)
-    body = Kilim.row([left, middle, right] of Widget, sizing: Kilim.fill)
+    @editor = Kilim.column([@title_slot, Kilim.row([@status] of Widget), @labels_slot, @notes, Kilim.row([Kilim.button("Delete")] of Widget)] of Widget,
+      spacing: 8, sizing: Kilim.fill)
+    # Without a task there is nothing to type into: text typed there would have nowhere to go.
+    @no_task = Kilim.label("No task selected")
+    @right = Kilim.column([@editor] of Widget, padding: 8, sizing: Kilim.fill)
+    body = Kilim.row([left, middle, @right] of Widget, sizing: Kilim.fill)
     @root = Kilim.column([body, Kilim.row([@status_line] of Widget, padding: 8)] of Widget)
     hook.app = self
     @projects.on_select = ->(i : Int32) { select_project(@projects.rows[i].key); nil }
@@ -195,6 +201,7 @@ pub class App
   # Fills the right pane from the current task; GitHub owns a GitHub task's title and labels.
   def show_task : Nil
     t = current_task
+    swap(@right, t ? @editor : @no_task)
     gh = t ? t.github? : false
     swap(@title_slot, gh ? @title_ro : @title)
     swap(@labels_slot, gh ? @labels_ro : @labels)

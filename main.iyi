@@ -41,6 +41,10 @@ def choose(win : Window, list : ListView, key : String) : Nil
   fail("could not select row " + key) unless list.selected == want
 end
 
+def editors?(app : App) : Bool
+  app.notes.attached_to?(app.root) || app.title.attached_to?(app.root) || app.title_ro.attached_to?(app.root)
+end
+
 def row_key(app : App, title : String) : String
   r = app.tasks.rows.find { |x| !x.header && x.title == title } || fail("no task row " + title.inspect)
   r.key
@@ -70,8 +74,12 @@ def seed(root : String) : Nil
 end
 
 def selftest(win : Window, app : App, bmp : String) : Nil
-  # Project click: three headers, three tasks.
+  # No task selected: no editors to type into.
   win.step
+  fail("editors shown without a task") if editors?(app)
+  fail("no-task label missing") unless app.no_task.attached_to?(app.root)
+
+  # Project click: three headers, three tasks.
   p = app.projects
   win.inject MouseDown.new(p.bounds.x + 20, p.bounds.y + 4, MouseButton::Left)
   win.inject MouseUp.new(p.bounds.x + 20, p.bounds.y + 4, MouseButton::Left)
@@ -80,20 +88,27 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("headers: " + heads.inspect) unless heads == ["To do (1)", "Doing (1)", "Done (1)"]
   fail("task rows: " + app.tasks.rows.size.to_s) unless app.tasks.rows.size == 6
   fail("detail: " + app.tasks.rows[3].detail.inspect) unless app.tasks.rows[3].detail == "gui, kilim"
+  fail("editors shown after a project click") if editors?(app)
 
   # Task selection fills the right pane.
   id = row_key(app, "Write the spec")
   choose(win, app.tasks, id)
+  fail("editors missing with a task") unless editors?(app) && !app.no_task.attached_to?(app.root)
   fail("title field: " + app.title.text.inspect) unless app.title.text == "Write the spec"
   fail("notes field: " + app.notes.text.inspect) unless app.notes.text == "first notes"
   fail("labels field: " + app.labels.text.inspect) unless app.labels.text == "docs"
   fail("local title is not a Textbox") unless app.title.attached_to?(app.root) && !app.title_ro.attached_to?(app.root)
 
-  # Typing autosaves 500 ms after the last change, not before.
+  # Typing autosaves 500 ms after the last change: each keystroke restarts the wait.
   click(win, app.notes)
-  win.inject TextInput.new("çğış typed. ")
-  fail("saved before 500 ms") if file_of(id).includes?("çğış typed.")
-  sleep(600)
+  win.inject TextInput.new("çğış ")
+  sleep(300)
+  win.step
+  win.inject TextInput.new("typed. ")
+  sleep(300)
+  win.step
+  fail("saved 300 ms after the last change") if file_of(id).includes?("çğış")
+  sleep(350)
   win.step
   fail("autosave did not write the notes:\n" + file_of(id)) unless file_of(id).includes?("çğış typed.")
 
@@ -115,6 +130,7 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   win.inject TextInput.new("switch ")
   choose(win, app.projects, "beta")
   fail("switch did not save:\n" + file_of(id)) unless file_of(id).includes?("switch ")
+  fail("editors shown after switching project") if editors?(app)
 
   # A GitHub task: title and labels read-only.
   choose(win, app.tasks, "beta-12")
@@ -126,10 +142,14 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   # The close path: flush right after typing, no waiting.
   click(win, app.notes)
   win.inject TextInput.new("closing")
+  # The hidden Textboxes must never reach a GitHub task's file.
+  app.title.text = "X"
+  app.labels.text = "X"
   app.flush
   f = file_of("beta-12")
   fail("flush did not write:\n" + f) unless f.includes?("closing")
   fail("GitHub title changed:\n" + f) unless f.includes?("title: \"Crash on start\"")
+  fail("GitHub labels changed:\n" + f) unless f.includes?("labels: [\"bug\"]")
 
   win.step
   win.screenshot(bmp)
@@ -166,4 +186,6 @@ if bmp
 else
   win.run
   app.flush
+  # the window is gone: the status line's message is the only trace of a failed last save
+  STDERR.puts "loser: " + app.status_line.text if app.dirty
 end
