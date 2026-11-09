@@ -1,0 +1,3 @@
+module main
+
+puts "loser 0.1.0-dev"

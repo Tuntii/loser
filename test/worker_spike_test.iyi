@@ -1,0 +1,30 @@
+module test/worker_spike_test
+
+import std/mutex::{Mutex}
+import std/atomic
+import std/process::{Process, ProcessResult}
+import std/dir::{Dir}
+import loser/paths
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+# Proof for the worker design: process, files and directories work inside spawn_parallel.
+def main : Int32
+  dir = Loser::Testkit.temp_root("worker_spike")
+  code = Atomic(Int32).new(-1)
+  seen = Mutex.new { "" }
+  group do |g|
+    g.spawn_parallel {
+      r = Process.run("git", ["--version"])
+      code.set(r.is_a?(ProcessResult) ? r.exit_code : 99)
+      Loser::Paths.write_atomic(dir + "/w.md", "hi")
+      seen.update { |_| Dir.children(dir).join(",") }
+      nil
+    }
+  end
+  expect_eq(code.get, 0, "git --version exit code")
+  expect_eq(seen.get { |s| s }, "w.md", "worker listed the file")
+  0
+end
+
+exit main
