@@ -1,3 +1,9 @@
 module main
 
+import loser/paths
+import loser/mcp
+
+if Program.args.first? == "mcp"
+  exit Loser::Mcp.serve(Loser::Paths.root)
+end
 puts "loser 0.1.0-dev"
