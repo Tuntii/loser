@@ -49,6 +49,9 @@ def main : Int32
   File.write(root + "/aa/x.conflict-1.md", "x")
   File.write(root + "/aa/y.md.tmp", "x")
   File.write(root + "/stray.md", "x")
+  Dir.mkdir_p(root + "/.sync.lock")
+  File.write(root + "/.sync.lock/a.md", "x")
+  Dir.mkdir_p(root + "/aa/dir.md")
   t0 = Time.monotonic
   out = Loser::Changes.scan(root)
   ms = (Time.monotonic - t0).total_milliseconds
@@ -59,6 +62,8 @@ def main : Int32
   expect(!out.includes?("conflict"), "no conflict file")
   expect(!out.includes?(".tmp"), "no tmp")
   expect(!out.includes?("stray"), "no stray")
+  expect(!out.includes?(".sync.lock"), "no dot-folder")
+  expect(!out.includes?("dir.md"), "no folder named *.md")
   expect_eq(lines[0].split("\t").size, 3, "path, mtime, size")
 
   # changed_paths

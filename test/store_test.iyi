@@ -105,6 +105,13 @@ def main : Int32
   expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by load")
   other = mk(s4, "kilim", "Other", "", "todo", [] of String, now)
   s4.save(other, now)
+
+  # a folder named like a task file is no task file
+  Dir.mkdir_p(r2 + "/kilim/dir.md")
+  s4b = Loser::Store::Store.new(r2)
+  s4b.load
+  expect_eq(s4b.tasks("kilim").size, 1, "a dir.md folder does not break load")
+  expect(s4b.reload_file(r2 + "/kilim/dir.md").nil?, "reload of a dir.md folder")
   expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by save")
 
   # add_project

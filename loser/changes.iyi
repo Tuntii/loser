@@ -24,13 +24,15 @@ end
 
 # One line "<path>\t<mtime ns>\t<size>" for projects.toml and every <folder>/*.md of the root,
 # sorted by path. Plain files and directories only, no C calls: safe inside spawn_parallel.
-# Folders that are not projects are listed too; changed_paths ignores them.
+# Folders that are not projects are listed too; changed_paths ignores them. Dot-folders (.git, and
+# .sync.lock, which a sync removes at any moment) and entries that are not regular files are skipped.
 pub def scan(root : String) : String
   r = clean_path(File.expand_path(clean_path(root)))   # exactly the Store root form
   files = [] of String
   files << r + "/projects.toml"
   if Dir.exists?(r)
     Dir.children(r).each do |d|
+      next if d.starts_with?(".")
       dir = r + "/" + d
       next unless Dir.exists?(dir)
       Dir.children(dir).each do |name|
@@ -40,7 +42,7 @@ pub def scan(root : String) : String
   end
   out = String.build do |s|
     files.sorted.each do |p|
-      if st = file_stamp(p)
+      if File.file?(p) && (st = file_stamp(p))
         s << p << "\t" << st[0] << "\t" << st[1] << "\n"
       end
     end
