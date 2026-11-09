@@ -2,8 +2,16 @@ module main
 
 import loser/paths
 import loser/mcp
+import loser/sync
 
-if Program.args.first? == "mcp"
+cmd = Program.args.first?
+if cmd == "mcp"
   exit Loser::Mcp.serve(Loser::Paths.root)
+end
+if cmd == "sync"
+  summary = Loser::Sync.run_sync(Loser::Paths.root, Program.args[1]?)
+  puts summary
+  # every failure text from gh_issues, the lock and the empty case, differs from a success by what follows "GitHub: "
+  exit(summary.includes?(" new, ") && !summary.includes?("; ") ? 0 : 1)
 end
 puts "loser 0.1.0-dev"

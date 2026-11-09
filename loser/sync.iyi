@@ -1,0 +1,112 @@
+# One sync run: the lock, the per-project state, and the summary line.
+
+module loser/sync
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/file_utils::{FileUtils}
+import std/process::{Process}
+import std/time::{Time, TimeParseError}
+import std/toml::{TOML, TOMLError}
+import loser/paths
+import loser/store::{Store}
+import loser/github::{Issue, gh_issues, apply_issue}
+
+STALE_SECONDS = 600_i64
+
+# nil when the lock is ours now, else the text for the status line.
+def acquire(root : String) : String?
+  lock = root + "/.sync.lock"
+  2.times do
+    unless Dir.exists?(lock)
+      # shortcut: iyi has no mkdir that answers an error, so two processes can both pass the check and the loser panics; upgrade when std grows one.
+      Dir.mkdir(lock)
+      File.write(lock + "/owner", Process.pid.to_s + " " + Time.utc.to_rfc3339)
+      return nil
+    end
+    return "GitHub: another sync is running" unless stale?(lock)
+    FileUtils.rm_rf(lock)
+  end
+  "GitHub: another sync is running"
+end
+
+# The owner file's time says how old the lock is; a folder without a readable owner file falls back to its own mtime.
+def stale?(lock : String) : Bool
+  now = Time.utc.to_unix
+  owner = lock + "/owner"
+  if File.exists?(owner)
+    parts = File.read(owner).strip.split(" ")
+    if parts.size == 2
+      t = Time::Format::RFC_3339.parse(parts[1])
+      return now - t.to_unix > STALE_SECONDS unless t.is_a?(TimeParseError)
+    end
+  end
+  info = File.info?(lock) || return true
+  now - info.modification_time > STALE_SECONDS
+end
+
+def read_state(root : String) : Hash(String, String)
+  out_hash = Hash(String, String).new
+  path = root + "/.sync-state.toml"
+  return out_hash unless File.exists?(path)
+  doc = TOML.parse(File.read(path))
+  return out_hash if doc.is_a?(TOMLError)
+  last = doc["last"]?
+  return out_hash if last.nil?
+  h = last.as_h? || return out_hash
+  h.each do |k, v|
+    if s = v.as_s?
+      out_hash[k] = s
+    end
+  end
+  out_hash
+end
+
+def write_state(root : String, state : Hash(String, String)) : Nil
+  Loser::Paths.write_atomic(root + "/.sync-state.toml", TOML.dump(TOML.to_any({"last" => state})))
+end
+
+# Syncs every project with a repo (or just `only`) and answers the summary for the status line.
+pub def run_sync(root : String, only : String? = nil, fetch : (String, String? -> Array(Issue) | String) = ->gh_issues(String, String?)) : String
+  if err = acquire(root)
+    return err
+  end
+  summary = sync_locked(root, only, fetch)
+  FileUtils.rm_rf(root + "/.sync.lock")
+  summary
+end
+
+def sync_locked(root : String, only : String?, fetch : (String, String? -> Array(Issue) | String)) : String
+  store = Store.new(root)
+  store.load
+  linked = store.projects.select { |p| !p.repo.nil? && (only.nil? || p.key == only) }
+  return "GitHub: no project is linked to a repo" if linked.empty?
+  state = read_state(root)
+  created = 0
+  updated = 0
+  synced = 0
+  failure : String? = nil
+  linked.each do |p|
+    break if failure
+    started = Time.utc.to_rfc3339
+    got = fetch.call(p.repo || "", state[p.key]?)
+    if got.is_a?(String)
+      failure = got
+    else
+      got.each do |i|
+        case apply_issue(store, p, i)
+        when "created" then created += 1
+        when "updated" then updated += 1
+        end
+      end
+      state[p.key] = started
+      synced += 1
+    end
+  end
+  write_state(root, state) if synced > 0
+  counts = "GitHub: " + created.to_s + " new, " + updated.to_s + " updated"
+  if f = failure
+    return synced > 0 ? counts + "; " + f : f
+  end
+  synced > 1 ? counts + " in " + synced.to_s + " projects" : counts
+end

@@ -6,6 +6,7 @@ module loser/mcp
 import std/json::{JSON, Any, Builder}
 import loser/store::{Store}
 import loser/task::{Task, STATUSES}
+import loser/sync
 
 PROTOCOL = "2025-06-18"
 S = "string"
@@ -321,7 +322,7 @@ end
 pub def serve(root : String) : Int32
   store = Store.new(root)
   store.load
-  server = Server.new(store)
+  server = Server.new(store, ->(only : String?) { Loser::Sync.run_sync(root, only) })
   while line = STDIN.read_line(true)
     next if line.strip.empty?
     if ans = server.handle(line)
