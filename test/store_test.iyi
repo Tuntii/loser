@@ -1,0 +1,130 @@
+module test/store_test
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/regex::{Regex}
+import std/time::{Time}
+import loser/store
+import loser/projects
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def seed(name : String) : String
+  root = Loser::Testkit.temp_root(name)
+  Loser::Projects.save_projects(root, [Loser::Projects::Project.new("kilim", "Kilim")])
+  root
+end
+
+def main : Int32
+  now = Time.utc(2026, 11, 9, 10, 0, 0)
+
+  # create, reload, order, search, delete
+  root = seed("store_main")
+  st = Loser::Store::Store.new(root)
+  st.load
+  a = st.create("kilim", "Zeta", "", "done", [] of String, now)
+  b = st.create("kilim", "Alpha", "notes about çağ", "todo", [] of String, now)
+  c = st.create("kilim", "Mid", "", "doing", ["x"], now)
+  [a, b, c].each { |t| expect(!(/^kilim-20261109100000[a-z]{3}$/ =~ t.id).nil?, "id shape " + t.id) }
+  expect(a.id != b.id && b.id != c.id && a.id != c.id, "ids distinct")
+  expect_eq(a.updated, "2026-11-09T10:00:00Z", "updated stamp")
+  expect(File.exists?(st.path_of(a)), "file written")
+  expect(!File.exists?(st.path_of(a) + ".tmp"), "no tmp")
+  expect(st.mtime(st.path_of(a)) != nil, "mtime remembered")
+  expect(Loser::Store.mtime_ns(st.path_of(a)) == st.mtime(st.path_of(a)), "mtime matches disk")
+
+  st2 = Loser::Store::Store.new(root)
+  st2.load
+  expect_eq(st2.projects.size, 1, "projects loaded")
+  expect_eq(st2.tasks("kilim").map { |t| t.title }.join(","), "Alpha,Mid,Zeta", "todo, doing, done")
+  expect_eq((st2.find(c.id) || raise("find")).labels.join(","), "x", "labels survive")
+  expect(st2.find("nope").nil?, "find miss")
+  expect_eq(st2.project_of(c).key, "kilim", "project_of")
+
+  expect_eq(st2.search(nil, nil, "çağ").map { |t| t.title }.join(","), "Alpha", "search case-insensitive Turkish")
+  expect_eq(st2.search(nil, nil, "ÇAĞ").size, 1, "search upper query meets lower notes after fold")
+  expect_eq(st2.search("kilim", "done", nil).size, 1, "search by status")
+  expect_eq(st2.search("other", nil, nil).size, 0, "search other project")
+  expect_eq(st2.search(nil, nil, nil).size, 3, "search all")
+
+  b.status = "doing"
+  st.save(b, Time.utc(2026, 11, 9, 11, 0, 0))
+  expect_eq(b.updated, "2026-11-09T11:00:00Z", "save stamps updated")
+
+  st2.delete(st2.find(a.id) || raise("find a"))
+  expect(!File.exists?(st.path_of(a)), "local delete removes file")
+  expect(st2.find(a.id).nil?, "local delete forgets")
+
+  # GitHub task: delete hides
+  g = st.create("kilim", "From GitHub", "", "todo", [] of String, now)
+  g.github = "Tuntii/kilim#12"
+  st.save(g, now)
+  st.delete(g)
+  expect(File.exists?(st.path_of(g)), "github delete keeps file")
+  expect(File.read(st.path_of(g)).includes?("hidden: true"), "hidden: true on disk")
+  expect(!st.tasks("kilim").any? { |t| t.id == g.id }, "hidden not listed")
+  expect(st.search(nil, nil, "GitHub").empty?, "hidden not searched")
+  st3 = Loser::Store::Store.new(root)
+  st3.load
+  expect(!st3.tasks("kilim").any? { |t| t.id == g.id }, "hidden stays hidden after load")
+
+  # reload_file
+  p = st3.path_of(c)
+  File.write(p, File.read(p).sub("title: \"Mid\"", "title: \"Mid2\""))
+  r = st3.reload_file(p) || raise("reload")
+  expect_eq(r.title, "Mid2", "reload_file title")
+  expect_eq((st3.find(c.id) || raise("f")).title, "Mid2", "reload_file in memory")
+  File.delete(p)
+  expect(st3.reload_file(p).nil?, "reload of a deleted file")
+  expect(st3.find(c.id).nil?, "deleted file forgotten")
+
+  # broken, conflict and tmp files
+  r2 = seed("store_broken")
+  File.write(r2 + "/projects.toml", File.read(r2 + "/projects.toml"))
+  Dir.mkdir_p(r2 + "/kilim")
+  File.write(r2 + "/kilim/bad.md", "no front matter here\n")
+  File.write(r2 + "/kilim/x.conflict-1.md", "---\nid: \"kilim-x\"\ntitle: \"X\"\n---\n")
+  File.write(r2 + "/kilim/y.md.tmp", "---\nid: \"kilim-y\"\ntitle: \"Y\"\n---\n")
+  s4 = Loser::Store::Store.new(r2)
+  s4.load
+  expect_eq(s4.errors.join(","), "kilim/bad.md", "only bad.md is an error")
+  expect_eq(s4.tasks("kilim").size, 0, "conflict and tmp ignored")
+  expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by load")
+  other = s4.create("kilim", "Other", "", "todo", [] of String, now)
+  s4.save(other, now)
+  expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by save")
+
+  # add_project
+  r3 = Loser::Testkit.temp_root("store_addproject")
+  s5 = Loser::Store::Store.new(r3)
+  s5.load
+  assert_panics { s5.add_project("loser", "x") }
+  expect(!File.exists?(r3 + "/projects.toml"), "invalid repo writes nothing")
+  np = s5.add_project("Loser", "Tuntii/loser")
+  expect_eq(np.key, "loser", "derived key")
+  expect(File.read(r3 + "/projects.toml").includes?("key = \"loser\""), "projects.toml written")
+  expect_eq(s5.add_project("Loser", nil).key, "loser-2", "key avoids a taken one")
+
+  # broken projects.toml: reported, never overwritten
+  r4 = Loser::Testkit.temp_root("store_badtoml")
+  File.write(r4 + "/projects.toml", "[[project\nkey = ")
+  s6 = Loser::Store::Store.new(r4)
+  s6.load
+  expect_eq(s6.projects.size, 0, "no projects from a broken file")
+  expect(s6.errors.size == 1 && s6.errors[0].starts_with?("projects.toml: "), "toml error named")
+  assert_panics { s6.add_project("A", nil) }
+  expect_eq(File.read(r4 + "/projects.toml"), "[[project\nkey = ", "broken projects.toml untouched")
+
+  # keys from the file are validated
+  r5 = Loser::Testkit.temp_root("store_keys")
+  File.write(r5 + "/projects.toml", "[[project]]\nkey = \"../x\"\nname = \"X\"\n[[project]]\nkey = \"ok\"\nname = \"Ok\"\n[[project]]\nkey = \"ok\"\nname = \"Again\"\n[[project]]\nkey = \"-no\"\nname = \"No\"\n")
+  s7 = Loser::Store::Store.new(r5)
+  s7.load
+  expect_eq(s7.projects.map { |q| q.key }.join(","), "ok", "only the valid unique key")
+  expect(s7.errors.includes?("projects.toml: invalid key \"../x\""), "invalid key named")
+  expect(s7.errors.includes?("projects.toml: duplicate key \"ok\""), "duplicate key named")
+  expect(s7.errors.includes?("projects.toml: invalid key \"-no\""), "leading dash invalid")
+  0
+end
+
+exit main

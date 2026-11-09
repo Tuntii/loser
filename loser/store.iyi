@@ -1,0 +1,253 @@
+# The store: every task and project under one root folder.
+
+module loser/store
+
+import std/file::{File}
+import std/dir::{Dir}
+import std/random::{Random}
+import std/unicode::{Unicode}
+import std/time::{Time}
+import loser/paths
+import loser/task::{Task, STATUSES, parse_task, render_task}
+import loser/projects::{Project, load_projects, save_projects, derive_key, valid_repo?}
+
+# Modification time of a file in nanoseconds since the epoch; nil when it is missing.
+# shortcut: File.info only has whole seconds, so two writes in one second look alike; upgrade when std grows sub-second times.
+pub def mtime_ns(path : String) : Int64?
+  info = File.info?(path) || return nil
+  info.modification_time * 1000000000_i64
+end
+
+def valid_key?(k : String) : Bool
+  return false if k.empty?
+  k.chars.each_with_index do |c, i|
+    ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && c == '-')
+    return false unless ok
+  end
+  true
+end
+
+def ignored_file?(name : String) : Bool
+  !name.ends_with?(".md") || name.includes?(".conflict-")
+end
+
+pub class Store
+  getter root : String
+  getter projects : Array(Project)
+  getter errors : Array(String)
+
+  def initialize(@root : String)
+    @root = @root.gsub("\\", "/")
+    @projects = [] of Project
+    @errors = [] of String
+    @tasks = [] of Task
+    @keys = Hash(String, String).new   # task id -> project key
+    @paths = Hash(String, String).new  # task id -> file path
+    @mtimes = Hash(String, Int64).new
+    @projects_broken = false
+  end
+
+  # Projects, then every <key>/*.md that is not *.conflict-*.md.
+  pub def load : Nil
+    @projects = [] of Project
+    @errors = [] of String
+    @tasks = [] of Task
+    @keys = Hash(String, String).new
+    @paths = Hash(String, String).new
+    @mtimes = Hash(String, Int64).new
+    @projects_broken = false
+    loaded = load_projects(@root)
+    if loaded.is_a?(String)
+      @projects_broken = true
+      @errors << loaded
+    else
+      loaded.each do |p|
+        if !valid_key?(p.key)
+          @errors << "projects.toml: invalid key " + p.key.inspect
+        elsif @projects.any? { |q| q.key == p.key }
+          @errors << "projects.toml: duplicate key " + p.key.inspect
+        else
+          @projects << p
+        end
+      end
+    end
+    @projects.each do |p|
+      dir = @root + "/" + p.key
+      next unless Dir.exists?(dir)
+      Dir.children(dir).sorted.each do |name|
+        next if ignored_file?(name)
+        read_into(p.key, dir + "/" + name)
+      end
+    end
+  end
+
+  # not hidden, status order, then title
+  pub def tasks(key : String) : Array(Task)
+    list = @tasks.select { |t| !t.hidden && @keys[t.id]? == key }
+    list.sorted do |a, b|
+      sa = STATUSES.index(a.status) || 0
+      sb = STATUSES.index(b.status) || 0
+      if sa != sb
+        sa < sb ? -1 : 1
+      else
+        ta = fold(a.title)
+        tb = fold(b.title)
+        ta < tb ? -1 : (ta > tb ? 1 : 0)
+      end
+    end
+  end
+
+  pub def find(id : String) : Task?
+    @tasks.find { |t| t.id == id }
+  end
+
+  pub def project_of(t : Task) : Project
+    key = @keys[t.id]? || raise("unknown task " + t.id)
+    @projects.find { |p| p.key == key } || raise("unknown project " + key)
+  end
+
+  pub def path_of(t : Task) : String
+    @paths[t.id]? || raise("unknown task " + t.id)
+  end
+
+  pub def create(key : String, title : String, notes : String = "", status : String = "todo",
+                 labels : Array(String) = [] of String, now : Time = Time.utc) : Task
+    raise "unknown project " + key unless @projects.any? { |p| p.key == key }
+    rng = Random.new
+    stamp = now.to_s("%Y%m%d%H%M%S")
+    id = ""
+    path = ""
+    loop do
+      suffix = ""
+      3.times { suffix += ('a' + rng.rand(26)).to_s }
+      id = key + "-" + stamp + suffix
+      path = @root + "/" + key + "/" + id + ".md"
+      break unless File.exists?(path) || @keys.has_key?(id)
+    end
+    t = Task.new(id, title)
+    t.notes = notes
+    t.status = STATUSES.includes?(status) ? status : "todo"
+    t.labels = labels
+    @tasks << t
+    @keys[id] = key
+    @paths[id] = path
+    save(t, now)
+    t
+  end
+
+  # Sets updated (RFC 3339, UTC, seconds) and writes the file.
+  pub def save(t : Task, now : Time = Time.utc) : Nil
+    path = path_of(t)
+    t.updated = now.to_utc.to_rfc3339
+    Loser::Paths.write_atomic(path, render_task(t))
+    remember(path)
+  end
+
+  # Local task: remove the file. GitHub task: keep it, hidden, so sync does not bring it back.
+  pub def delete(t : Task) : Nil
+    if t.github?
+      t.hidden = true
+      save(t)
+      return
+    end
+    path = path_of(t)
+    File.delete(path) if File.exists?(path)
+    forget(t.id)
+  end
+
+  pub def search(key : String?, status : String?, query : String?) : Array(Task)
+    keys = key ? [key] : @projects.map { |p| p.key }
+    q = query ? fold(query) : nil
+    out_list = [] of Task
+    keys.each do |k|
+      tasks(k).each do |t|
+        next if status && t.status != status
+        next if q && !fold(t.title).includes?(q) && !fold(t.notes).includes?(q)
+        out_list << t
+      end
+    end
+    out_list
+  end
+
+  pub def add_project(name : String, repo : String?) : Project
+    raise "projects.toml is unreadable, not touching it" if @projects_broken
+    if r = repo
+      raise "invalid repo " + r.inspect + ", expected owner/name" unless valid_repo?(r)
+    end
+    p = Project.new(derive_key(name, @projects.map { |q| q.key }), name)
+    p.repo = repo
+    list = @projects.dup
+    list << p
+    save_projects(@root, list)
+    @projects = list
+    p
+  end
+
+  # Re-reads one task file (absolute path); nil when it is gone, broken or not a task file.
+  pub def reload_file(path : String) : Task?
+    path = path.gsub("\\", "/")
+    old_id : String? = nil
+    @paths.each { |id, pth| old_id = id if pth == path }
+    key = File.basename(File.dirname(path))
+    rel = key + "/" + File.basename(path)
+    unless File.exists?(path)
+      if oid = old_id
+        forget(oid)
+      end
+      @errors.delete(rel)
+      return nil
+    end
+    return nil if ignored_file?(File.basename(path))
+    return nil unless @projects.any? { |p| p.key == key } && File.dirname(File.dirname(path)) == @root
+    if oid = old_id
+      forget(oid)
+    end
+    read_into(key, path)
+  end
+
+  # The modification time the store last saw or wrote, in nanoseconds.
+  pub def mtime(path : String) : Int64?
+    @mtimes[path.gsub("\\", "/")]?
+  end
+
+  def remember(path : String) : Nil
+    if m = mtime_ns(path)
+      @mtimes[path] = m
+    end
+  end
+
+  def forget(id : String) : Nil
+    if path = @paths[id]?
+      @mtimes.delete(path)
+    end
+    @tasks = @tasks.reject { |t| t.id == id }
+    @keys.delete(id)
+    @paths.delete(id)
+  end
+
+  # Parses one file into the list; a file that cannot be read goes to errors and nowhere else.
+  def read_into(key : String, path : String) : Task?
+    rel = key + "/" + File.basename(path)
+    @errors.delete(rel)
+    t = parse_task(File.read(path))
+    if t.nil?
+      @errors << rel
+      return nil
+    end
+    if @keys.has_key?(t.id)
+      @errors << rel
+      return nil
+    end
+    @tasks << t
+    @keys[t.id] = key
+    @paths[t.id] = path
+    remember(path)
+    t
+  end
+end
+
+# Unicode case folding (String#downcase is ASCII only: "ÇAĞ" would not meet "çağ").
+# A file with ill-formed UTF-8 falls back to ASCII folding instead of panicking.
+def fold(s : String) : String
+  Unicode.valid?(s) ? Unicode.foldcase(s) : s.downcase
+end
