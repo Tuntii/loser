@@ -1,0 +1,333 @@
+# The MCP server: JSON-RPC 2.0 over stdio, one JSON object per line.
+# iyi has no rescue, so nothing a client sends may reach a panic: every argument is checked first.
+
+module loser/mcp
+
+import std/json::{JSON, Any, Builder}
+import loser/store::{Store}
+import loser/task::{Task, STATUSES}
+
+PROTOCOL = "2025-06-18"
+S = "string"
+
+# One tool's arguments, checked as they are read; the first complaint wins.
+class Args
+  getter errors : Array(String)
+
+  def initialize(@h : Hash(String, Any))
+    @errors = [] of String
+  end
+
+  def str(name : String, required : Bool = false) : String?
+    v = @h[name]?
+    if v.nil? || v.raw.nil?
+      @errors << "missing argument: " + name if required
+      return nil
+    end
+    s = v.as_s?
+    @errors << name + " must be a string" if s.nil?
+    s
+  end
+
+  # A status that is one of todo|doing|done.
+  def status : String?
+    s = str("status") || return nil
+    return s if STATUSES.includes?(s)
+    @errors << "status must be one of todo, doing, done"
+    nil
+  end
+
+  def labels : Array(String)?
+    v = @h["labels"]?
+    return nil if v.nil? || v.raw.nil?
+    arr = v.as_a?
+    if arr.nil?
+      @errors << "labels must be an array of strings"
+      return nil
+    end
+    out_list = [] of String
+    arr.each do |x|
+      s = x.as_s?
+      if s.nil?
+        @errors << "labels must be an array of strings"
+        return nil
+      end
+      out_list << s
+    end
+    out_list
+  end
+end
+
+def opt(b : Builder, name : String, v : String?) : Nil
+  if s = v
+    b.field(name, s)
+  else
+    b.field(name, nil)
+  end
+end
+
+def strings(b : Builder, name : String, list : Array(String)) : Nil
+  b.field(name) do
+    b.array { list.each { |s| b.string(s) } }
+  end
+end
+
+def row_json(b : Builder, st : Store, t : Task) : Nil
+  b.object do
+    b.field("id", t.id)
+    b.field("project", st.project_of(t).key)
+    b.field("title", t.title)
+    b.field("status", t.status)
+    strings(b, "labels", t.labels)
+    opt(b, "github", t.github)
+  end
+end
+
+def full_json(b : Builder, st : Store, t : Task) : Nil
+  b.object do
+    b.field("id", t.id)
+    b.field("project", st.project_of(t).key)
+    b.field("title", t.title)
+    b.field("status", t.status)
+    strings(b, "labels", t.labels)
+    opt(b, "github", t.github)
+    opt(b, "github_kind", t.github_kind)
+    opt(b, "github_state", t.github_state)
+    b.field("updated", t.updated)
+    b.field("hidden", t.hidden)
+    b.field("notes", t.notes)
+  end
+end
+
+# name, description, properties {name, type, description}, required names
+def tool_json(b : Builder, name : String, desc : String, props : Array({String, String, String}), required : Array(String)) : Nil
+  b.object do
+    b.field("name", name)
+    b.field("description", desc)
+    b.field("inputSchema") do
+      b.object do
+        b.field("type", "object")
+        b.field("properties") do
+          b.object do
+            props.each do |p|
+              b.field(p[0]) do
+                b.object do
+                  if p[1] == "array"
+                    b.field("type", "array")
+                    b.field("items") { b.object { b.field("type", "string") } }
+                  else
+                    b.field("type", p[1])
+                  end
+                  b.field("description", p[2])
+                end
+              end
+            end
+          end
+        end
+        strings(b, "required", required)
+      end
+    end
+  end
+end
+
+def tools_json : String
+  JSON.build do |b|
+    b.array do
+      tool_json(b, "list_projects", "List the projects: key, name and GitHub repo.", [] of {String, String, String}, [] of String)
+      tool_json(b, "list_tasks", "List tasks, optionally of one project, of one status, or whose title or notes contain a text.",
+        [{"project", S, "project key"}, {"status", S, "todo, doing or done"}, {"query", S, "text to look for in title and notes"}], [] of String)
+      tool_json(b, "get_task", "One task with all its fields and notes.", [{"id", S, "task id"}], ["id"])
+      tool_json(b, "create_task", "Create a task in a project.",
+        [{"project", S, "project key"}, {"title", S, "title"}, {"notes", S, "notes (markdown)"},
+         {"status", S, "todo (default), doing or done"}, {"labels", "array", "labels"}], ["project", "title"])
+      tool_json(b, "update_task", "Change a task. Title and labels of a GitHub task belong to GitHub and are refused.",
+        [{"id", S, "task id"}, {"title", S, "new title"}, {"status", S, "todo, doing or done"}, {"labels", "array", "replaces the labels"},
+         {"notes", S, "replaces the notes"}, {"append_notes", S, "text added after the notes (not together with notes)"}], ["id"])
+      tool_json(b, "sync", "Sync GitHub issues and pull requests into the tasks now.", [{"project", S, "project key; all projects when omitted"}], [] of String)
+    end
+  end
+end
+
+def err_line(idj : String, code : Int32, msg : String) : String
+  "{\"jsonrpc\":\"2.0\",\"id\":" + idj + ",\"error\":{\"code\":" + code.to_s + ",\"message\":" + JSON.to_json(msg) + "}}"
+end
+
+def ok_line(idj : String, result : String) : String
+  "{\"jsonrpc\":\"2.0\",\"id\":" + idj + ",\"result\":" + result + "}"
+end
+
+def tool_result(text : String, is_error : Bool) : String
+  JSON.build do |b|
+    b.object do
+      b.field("content") do
+        b.array { b.object { b.field("type", "text"); b.field("text", text) } }
+      end
+      b.field("isError", is_error)
+    end
+  end
+end
+
+pub class Server
+  def initialize(@store : Store, @sync : (String? -> String)? = nil)
+  end
+
+  # One JSON-RPC message in, one line out; nil for a notification.
+  pub def handle(line : String) : String?
+    doc = JSON.parse?(line) || return err_line("null", -32700, "parse error")
+    req = doc.as_h? || return err_line("null", -32600, "invalid request")
+    id = req["id"]? || return nil   # no id: a notification, never answered
+    idj = JSON.to_json(id)
+    mv = req["method"]?
+    method = mv ? (mv.as_s? || "") : ""
+    params = req["params"]?
+    case method
+    when "initialize"
+      ver = PROTOCOL
+      if params && (ph = params.as_h?) && (pv = ph["protocolVersion"]?) && (s = pv.as_s?)
+        ver = s
+      end
+      ok_line(idj, "{\"protocolVersion\":" + JSON.to_json(ver) + ",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"loser\",\"version\":\"0.1.0\"}}")
+    when "ping"
+      ok_line(idj, "{}")
+    when "tools/list"
+      ok_line(idj, "{\"tools\":" + tools_json + "}")
+    when "tools/call"
+      ok_line(idj, call_tool(params))
+    else
+      err_line(idj, -32601, "method not found: " + method)
+    end
+  end
+
+  def call_tool(params : Any?) : String
+    ph = (params ? params.as_h? : nil) || return tool_result("params must be an object", true)
+    nv = ph["name"]?
+    name = (nv ? nv.as_s? : nil) || return tool_result("missing argument: name", true)
+    av = ph["arguments"]?
+    ah = {} of String => Any
+    if av && !av.raw.nil?
+      ah = av.as_h? || return tool_result("arguments must be an object", true)
+    end
+    @store.load   # the GUI may have written since the last call
+    a = Args.new(ah)
+    r = run(name, a)
+    if e = a.errors.first?
+      return tool_result(e, true)
+    end
+    tool_result(r[0], r[1])
+  end
+
+  # {text, is_error}
+  def run(name : String, a : Args) : {String, Bool}
+    case name
+    when "list_projects" then list_projects
+    when "list_tasks"    then list_tasks(a)
+    when "get_task"      then get_task(a)
+    when "create_task"   then create_task(a)
+    when "update_task"   then update_task(a)
+    when "sync"          then sync(a)
+    else {"unknown tool: " + name, true}
+    end
+  end
+
+  def list_projects : {String, Bool}
+    text = JSON.build do |b|
+      b.array do
+        @store.projects.each do |p|
+          b.object do
+            b.field("key", p.key)
+            b.field("name", p.name)
+            opt(b, "repo", p.repo)
+          end
+        end
+      end
+    end
+    {text, false}
+  end
+
+  def list_tasks(a : Args) : {String, Bool}
+    key = a.str("project")
+    status = a.status
+    query = a.str("query")
+    return {"", true} unless a.errors.empty?
+    if k = key
+      return {"unknown project " + k, true} unless @store.projects.any? { |p| p.key == k }
+    end
+    found = @store.search(key, status, query)
+    text = JSON.build do |b|
+      b.array { found.each { |t| row_json(b, @store, t) } }
+    end
+    {text, false}
+  end
+
+  def get_task(a : Args) : {String, Bool}
+    id = a.str("id", true)
+    return {"", true} unless a.errors.empty?
+    t = @store.find(id || "") || return {"unknown task " + (id || ""), true}
+    {JSON.build { |b| full_json(b, @store, t) }, false}
+  end
+
+  def create_task(a : Args) : {String, Bool}
+    project = a.str("project", true)
+    title = a.str("title", true)
+    notes = a.str("notes")
+    status = a.status
+    labels = a.labels
+    return {"", true} unless a.errors.empty?
+    made = @store.create(project || "", title || "", notes || "", status || "todo", labels || [] of String)
+    return {made, true} if made.is_a?(String)
+    {JSON.build { |b| full_json(b, @store, made) }, false}
+  end
+
+  def update_task(a : Args) : {String, Bool}
+    id = a.str("id", true)
+    title = a.str("title")
+    status = a.status
+    labels = a.labels
+    notes = a.str("notes")
+    more = a.str("append_notes")
+    return {"", true} unless a.errors.empty?
+    t = @store.find(id || "") || return {"unknown task " + (id || ""), true}
+    if (title || labels) && t.github?
+      return {t.id + " comes from GitHub: its title and labels are GitHub's", true}
+    end
+    return {"notes and append_notes cannot be used together", true} if notes && more
+    if ti = title
+      return {"title is empty", true} if ti.strip.empty?
+      t.title = ti
+    end
+    t.status = status if status
+    t.labels = labels if labels
+    t.notes = notes if notes
+    if m = more
+      cur = t.notes
+      t.notes = cur + (cur.empty? || cur.ends_with?("\n") ? "" : "\n") + m
+    end
+    if err = @store.save(t)
+      return {err, true}
+    end
+    {JSON.build { |b| full_json(b, @store, t) }, false}
+  end
+
+  def sync(a : Args) : {String, Bool}
+    project = a.str("project")
+    return {"", true} unless a.errors.empty?
+    cb = @sync || return {"sync is not available", true}
+    summary = cb.call(project)
+    {JSON.build { |b| b.object { b.field("summary", summary) } }, false}
+  end
+end
+
+# Reads requests from stdin until it closes; answers go to stdout, nothing else does.
+pub def serve(root : String) : Int32
+  store = Store.new(root)
+  store.load
+  server = Server.new(store)
+  while line = STDIN.read_line(true)
+    next if line.strip.empty?
+    if ans = server.handle(line)
+      STDOUT.puts ans
+      STDOUT.flush
+    end
+  end
+  0
+end

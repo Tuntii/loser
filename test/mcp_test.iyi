@@ -1,0 +1,138 @@
+module test/mcp_test
+
+import std/file::{File}
+import std/json::{JSON, Any}
+import loser/store
+import loser/projects
+import loser/task
+import loser/mcp
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def call(s : Loser::Mcp::Server, id : Int32, name : String, args : String) : Any
+  line = "{\"jsonrpc\":\"2.0\",\"id\":" + id.to_s + ",\"method\":\"tools/call\",\"params\":{\"name\":" + JSON.to_json(name) + ",\"arguments\":" + args + "}}"
+  ans = s.handle(line) || raise "no answer"
+  expect(!ans.includes?("\n"), "answer is one line")
+  JSON.parse(ans)
+end
+
+def text_of(r : Any) : String
+  r["result"]["content"][0]["text"].as_s
+end
+
+def error?(r : Any) : Bool
+  r["result"]["isError"].as_bool
+end
+
+def main : Int32
+  root = Loser::Testkit.temp_root("mcp")
+  p = Loser::Projects::Project.new("kilim", "Kilim")
+  p.repo = "tuntii/kilim"
+  Loser::Projects.save_projects(root, [p])
+  st = Loser::Store::Store.new(root)
+  st.load
+  s = Loser::Mcp::Server.new(st)
+
+  # protocol
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}") || "")
+  expect_eq(r["result"]["protocolVersion"].as_s, "2025-06-18", "eq")
+  expect_eq(r["result"]["serverInfo"]["name"].as_s, "loser", "eq")
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}") || "")
+  expect_eq(r["result"]["protocolVersion"].as_s, "2024-11-05", "eq")
+  expect_eq(r["id"].as_s, "a", "eq")
+  expect(s.handle("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}").nil?, "notification has no answer")
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}") || "")
+  expect_eq(r["result"].as_h.size, 0, "eq")
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}") || "")
+  names = r["result"]["tools"].as_a.map { |t| t["name"].as_s }
+  expect_eq(names.join(","), "list_projects,list_tasks,get_task,create_task,update_task,sync", "eq")
+  expect(r["result"]["tools"][0]["inputSchema"]["type"].as_s == "object", "inputSchema")
+  r = JSON.parse(s.handle("not json") || "")
+  expect_eq(r["error"]["code"].as_i, -32700, "eq")
+  expect(r["id"].raw.nil?, "parse error has null id")
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"nope\"}") || "")
+  expect_eq(r["error"]["code"].as_i, -32601, "eq")
+  expect_eq(r["id"].as_i, 7, "eq")
+  r = JSON.parse(s.handle("[1]") || "")
+  expect_eq(r["error"]["code"].as_i, -32600, "eq")
+
+  # list_projects
+  r = call(s, 10, "list_projects", "{}")
+  expect(!error?(r), "list_projects ok")
+  expect_eq(JSON.parse(text_of(r))[0]["repo"].as_s, "tuntii/kilim", "eq")
+
+  # create, list, get
+  r = call(s, 11, "create_task", "{\"project\":\"kilim\",\"title\":\"Fix çağ: bug\",\"notes\":\"a\",\"labels\":[\"x\"]}")
+  expect(!error?(r), "create ok: " + text_of(r))
+  created = JSON.parse(text_of(r))
+  id = created["id"].as_s
+  expect_eq(created["notes"].as_s, "a", "eq")
+  expect_eq(created["status"].as_s, "todo", "eq")
+  r = call(s, 12, "list_tasks", "{\"query\":\"ÇAĞ\"}")
+  list = JSON.parse(text_of(r))
+  expect_eq(list.size, 1, "eq")
+  expect_eq(list[0]["id"].as_s, id, "eq")
+  expect(list[0]["notes"]?.nil?, "list rows carry no notes")
+  r = call(s, 13, "list_tasks", "{\"status\":\"done\"}")
+  expect_eq(JSON.parse(text_of(r)).size, 0, "eq")
+  ids = JSON.to_json(id)
+  r = call(s, 14, "get_task", "{\"id\":" + ids + "}")
+  expect_eq(JSON.parse(text_of(r))["project"].as_s, "kilim", "eq")
+
+  # update: status, append_notes twice
+  r = call(s, 15, "update_task", "{\"id\":" + ids + ",\"status\":\"doing\"}")
+  expect_eq(JSON.parse(text_of(r))["status"].as_s, "doing", "eq")
+  expect(JSON.parse(text_of(r))["updated"].as_s != "", "updated set")
+  call(s, 16, "update_task", "{\"id\":" + ids + ",\"append_notes\":\"b\"}")
+  r = call(s, 17, "update_task", "{\"id\":" + ids + ",\"append_notes\":\"c\"}")
+  expect_eq(JSON.parse(text_of(r))["notes"].as_s, "a\nb\nc", "eq")
+  r = call(s, 18, "update_task", "{\"id\":" + ids + ",\"notes\":\"n\",\"append_notes\":\"m\"}")
+  expect(error?(r), "notes and append_notes together")
+  r = call(s, 19, "update_task", "{\"id\":" + ids + ",\"title\":\"New\",\"labels\":[\"y\",\"z\"]}")
+  expect_eq(JSON.parse(text_of(r))["title"].as_s, "New", "eq")
+
+  # bad arguments never panic
+  expect(error?(call(s, 20, "create_task", "{\"project\":\"kilim\"}")), "missing title")
+  expect(text_of(call(s, 21, "create_task", "{\"project\":\"kilim\"}")).includes?("title"), "names title")
+  expect(error?(call(s, 22, "create_task", "{\"project\":\"kilim\",\"title\":5}")), "number title")
+  expect(error?(call(s, 23, "create_task", "{\"project\":\"nope\",\"title\":\"t\"}")), "unknown project")
+  expect(error?(call(s, 24, "create_task", "{\"project\":\"kilim\",\"title\":\"t\",\"status\":\"x\"}")), "unknown status")
+  expect(error?(call(s, 25, "create_task", "{\"project\":\"kilim\",\"title\":\"t\",\"labels\":\"x\"}")), "labels not array")
+  expect(text_of(call(s, 26, "create_task", "{\"project\":\"kilim\",\"title\":\"t\",\"labels\":[1]}")).includes?("labels"), "labels not strings")
+  expect(error?(call(s, 27, "update_task", "{\"id\":" + ids + ",\"status\":\"x\"}")), "update unknown status")
+  expect(error?(call(s, 28, "get_task", "{\"id\":\"zzz\"}")), "unknown task")
+  expect(error?(call(s, 29, "get_task", "{\"id\":4}")), "number id")
+  expect(error?(call(s, 30, "nope", "{}")), "unknown tool")
+  expect(error?(call(s, 31, "list_tasks", "{\"project\":3}")), "number project")
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":5}") || "")
+  expect(error?(r), "params not an object")
+  r = JSON.parse(s.handle("{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"get_task\",\"arguments\":[]}}") || "")
+  expect(error?(r), "arguments not an object")
+
+  # GitHub task: title and labels are refused, file unchanged
+  t = st.find(id) || raise "task gone"
+  t.github = "tuntii/kilim#5"
+  st.save(t)
+  path = st.path_of(t)
+  before = File.read(path)
+  r = call(s, 40, "update_task", "{\"id\":" + ids + ",\"title\":\"X\"}")
+  expect(error?(r), "github title refused")
+  expect_eq(text_of(r), id + " comes from GitHub: its title and labels are GitHub's", "eq")
+  expect(error?(call(s, 41, "update_task", "{\"id\":" + ids + ",\"labels\":[]}")), "github labels refused")
+  expect_eq(File.read(path), before, "eq")
+  expect(!error?(call(s, 42, "update_task", "{\"id\":" + ids + ",\"status\":\"done\"}")), "github status ok")
+
+  # sync without a callback
+  r = call(s, 50, "sync", "{}")
+  expect(error?(r), "sync unavailable")
+  expect_eq(text_of(r), "sync is not available", "eq")
+  s2 = Loser::Mcp::Server.new(st, ->(k : String?) { "synced " + (k || "all") })
+  expect_eq(JSON.parse(text_of(call(s2, 51, "sync", "{\"project\":\"kilim\"}")))["summary"].as_s, "synced kilim", "eq")
+
+  # a write made behind the server's back is seen
+  File.write(path, File.read(path).sub("status: \"done\"", "status: \"todo\""))
+  expect_eq(JSON.parse(text_of(call(s, 60, "get_task", "{\"id\":" + ids + "}")))["status"].as_s, "todo", "eq")
+  0
+end
+
+exit main
