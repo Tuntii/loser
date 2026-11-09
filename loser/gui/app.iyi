@@ -361,11 +361,13 @@ pub class App
     conflict = true
     o = parse_task(text)
     if o && o.id == t.id
-      m = merge(t.title, t.notes, t.github? ? t.title : @title.text, @notes.text, o.title, o.notes)
+      # an emptied title field (being retyped) is no title: the saved one stands in for mine
+      mine_title = t.github? || @title.text.strip.empty? ? t.title : @title.text
+      m = merge(t.title, t.notes, mine_title, @notes.text, o.title, o.notes)
       conflict = m.conflict
       t.title = m.title
       t.notes = m.notes
-      @title.text = m.title unless t.github? || @title.text == m.title
+      @title.text = m.title unless t.github? || m.title == mine_title || @title.text == m.title
       @title_ro.text = m.title
       @notes.text = m.notes unless @notes.text == m.notes
       mine_status = STATUSES[@status.selected]

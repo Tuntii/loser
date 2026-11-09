@@ -374,6 +374,20 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("label conflict, status line: " + app.status_line.text.inspect) unless app.status_line.text.starts_with?("Saved your text; the other version is in " + bw + ".conflict-")
   fail("my labels lost:\n" + file_of(bw)) unless file_of(bw).includes?("\"mine\"") && !file_of(bw).includes?("\"theirs\"")
 
+  # A title field emptied to retype it: the autosave keeps the saved title and the field stays empty.
+  click(win, app.title)
+  ctrl(win, Key::A)
+  press(win, Key::Backspace)
+  sleep(550)
+  win.step
+  fail("emptied title saved:\n" + file_of(bw)) unless file_of(bw).includes?("title: \"Build the window\"")
+  fail("task gone after emptying its title") unless titles(app).includes?("Build the window")
+  fail("emptied title field refilled: " + app.title.text.inspect) unless app.title.text.empty?
+  win.inject TextInput.new("Build the window again")
+  sleep(550)
+  win.step
+  fail("retyped title not saved:\n" + file_of(bw)) unless file_of(bw).includes?("title: \"Build the window again\"")
+
   # A git pull of 200 new files plus the selected task: reloaded in slices across frames, the selected task first.
   choose(win, app.tasks, bw)
   200.times do |i|
