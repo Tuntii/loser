@@ -1,8 +1,142 @@
 module main
 
+import std/env::{ENV}
+import std/file::{File}
 import loser/paths
 import loser/mcp
 import loser/sync
+import loser/testkit
+import loser/store::{Store}
+import loser/task::{Task}
+import loser/gui/app::{App}
+import github.com/tuntii/kilim
+import github.com/tuntii/kilim/kilim/widget::{Widget}
+import github.com/tuntii/kilim/kilim/window::{Window}
+import github.com/tuntii/kilim/kilim/list_view::{ListView}
+import github.com/tuntii/kilim/kilim/event::*
+
+def fail(why : String) : NoReturn
+  puts "loser selftest FAIL: " + why
+  exit 1
+end
+
+def click(win : Window, w : Widget) : Nil
+  win.step
+  x = w.bounds.x + w.bounds.w / 2
+  y = w.bounds.y + w.bounds.h / 2
+  win.inject MouseDown.new(x, y, MouseButton::Left)
+  win.inject MouseUp.new(x, y, MouseButton::Left)
+end
+
+# Selects the row with this key the way the keyboard does: focus the list, then Up/Down.
+def choose(win : Window, list : ListView, key : String) : Nil
+  want = list.rows.index { |r| !r.header && r.key == key } || fail("no row " + key)
+  win.step
+  win.ui.focus(list)
+  (list.rows.size + 1).times do
+    cur = list.selected
+    break if cur == want
+    win.inject KeyDown.new((c = cur) && c > want ? Key::Up : Key::Down, Mods.new)
+  end
+  fail("could not select row " + key) unless list.selected == want
+end
+
+def row_key(app : App, title : String) : String
+  r = app.tasks.rows.find { |x| !x.header && x.title == title } || fail("no task row " + title.inspect)
+  r.key
+end
+
+def file_of(id : String) : String
+  key = id.starts_with?("beta-") ? "beta" : "alpha"
+  File.read(Loser::Paths.root + "/" + key + "/" + id + ".md")
+end
+
+def seed(root : String) : Nil
+  st = Store.new(root)
+  st.load
+  fail("add Alpha") if st.add_project("Alpha", nil).is_a?(String)
+  fail("add Beta") if st.add_project("Beta", "Tuntii/loser").is_a?(String)
+  fail("create") if st.create("alpha", "Write the spec", "first notes", "todo", ["docs"]).is_a?(String)
+  fail("create") if st.create("alpha", "Build the window", "", "doing", ["gui", "kilim"]).is_a?(String)
+  fail("create") if st.create("alpha", "Ship v0.1.0", "", "done").is_a?(String)
+  gh = Task.new("beta-12", "Crash on start")
+  gh.labels = ["bug"]
+  gh.github = "Tuntii/loser#12"
+  gh.github_kind = "issue"
+  gh.github_state = "open"
+  if err = st.save(gh)
+    fail(err)
+  end
+end
+
+def selftest(win : Window, app : App, bmp : String) : Nil
+  # Project click: three headers, three tasks.
+  win.step
+  p = app.projects
+  win.inject MouseDown.new(p.bounds.x + 20, p.bounds.y + 4, MouseButton::Left)
+  win.inject MouseUp.new(p.bounds.x + 20, p.bounds.y + 4, MouseButton::Left)
+  fail("Alpha not selected") unless (cp = app.current_project) && cp.key == "alpha"
+  heads = app.tasks.rows.select(&.header).map(&.title)
+  fail("headers: " + heads.inspect) unless heads == ["To do (1)", "Doing (1)", "Done (1)"]
+  fail("task rows: " + app.tasks.rows.size.to_s) unless app.tasks.rows.size == 6
+  fail("detail: " + app.tasks.rows[3].detail.inspect) unless app.tasks.rows[3].detail == "gui, kilim"
+
+  # Task selection fills the right pane.
+  id = row_key(app, "Write the spec")
+  choose(win, app.tasks, id)
+  fail("title field: " + app.title.text.inspect) unless app.title.text == "Write the spec"
+  fail("notes field: " + app.notes.text.inspect) unless app.notes.text == "first notes"
+  fail("labels field: " + app.labels.text.inspect) unless app.labels.text == "docs"
+  fail("local title is not a Textbox") unless app.title.attached_to?(app.root) && !app.title_ro.attached_to?(app.root)
+
+  # Typing autosaves 500 ms after the last change, not before.
+  click(win, app.notes)
+  win.inject TextInput.new("çğış typed. ")
+  fail("saved before 500 ms") if file_of(id).includes?("çğış typed.")
+  sleep(600)
+  win.step
+  fail("autosave did not write the notes:\n" + file_of(id)) unless file_of(id).includes?("çğış typed.")
+
+  # Status saves at once and moves the row under Done.
+  click(win, app.status)
+  win.inject KeyDown.new(Key::Down, Mods.new)
+  win.inject KeyDown.new(Key::Down, Mods.new)
+  win.inject KeyDown.new(Key::Enter, Mods.new)
+  fail("status not saved:\n" + file_of(id)) unless file_of(id).includes?("status: \"done\"")
+  rows = app.tasks.rows
+  done_at = rows.index { |r| r.header && r.title.starts_with?("Done") } || fail("no Done header")
+  at = rows.index { |r| r.key == id } || fail("row gone")
+  fail("row not under Done") unless at > done_at
+  fail("selection lost after the move") unless app.tasks.selected == at
+  fail("headers after move: " + rows.select(&.header).map(&.title).inspect) unless rows[0].title == "To do (0)"
+
+  # Switching project saves pending edits first.
+  click(win, app.notes)
+  win.inject TextInput.new("switch ")
+  choose(win, app.projects, "beta")
+  fail("switch did not save:\n" + file_of(id)) unless file_of(id).includes?("switch ")
+
+  # A GitHub task: title and labels read-only.
+  choose(win, app.tasks, "beta-12")
+  fail("GitHub title shows a Textbox") if app.title.attached_to?(app.root)
+  fail("GitHub title Label missing") unless app.title_ro.attached_to?(app.root) && app.title_ro.text == "Crash on start"
+  fail("GitHub labels") unless app.labels_ro.attached_to?(app.root) && app.labels_ro.text == "bug" && !app.labels.attached_to?(app.root)
+  fail("GitHub detail: " + app.tasks.rows[1].detail.inspect) unless app.tasks.rows[1].detail == "bug · #12"
+
+  # The close path: flush right after typing, no waiting.
+  click(win, app.notes)
+  win.inject TextInput.new("closing")
+  app.flush
+  f = file_of("beta-12")
+  fail("flush did not write:\n" + f) unless f.includes?("closing")
+  fail("GitHub title changed:\n" + f) unless f.includes?("title: \"Crash on start\"")
+
+  win.step
+  win.screenshot(bmp)
+  fail("no screenshot") unless File.exists?(bmp)
+  win.close
+  puts "loser selftest: ok"
+end
 
 cmd = Program.args.first?
 if cmd == "mcp"
@@ -14,4 +148,22 @@ if cmd == "sync"
   # every failure text from gh_issues, the lock and the empty case, differs from a success by what follows "GitHub: "
   exit(summary.includes?(" new, ") && !summary.includes?("; ") ? 0 : 1)
 end
-puts "loser 0.1.0-dev"
+
+bmp = ENV["LOSER_SELFTEST"]?
+if bmp
+  # never the real ~/loser
+  home = Loser::Testkit.temp_root("selftest")
+  seed(home)
+  ENV["LOSER_HOME"] = home
+end
+store = Store.new(Loser::Paths.root)
+store.load
+app = App.new(store)
+win = Kilim.window("loser", 1100, 700, app.root)
+app.win = win
+if bmp
+  selftest(win, app, bmp)
+else
+  win.run
+  app.flush
+end
