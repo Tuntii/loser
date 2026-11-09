@@ -26,7 +26,7 @@ end
 # sorted by path. Plain files and directories only, no C calls: safe inside spawn_parallel.
 # Folders that are not projects are listed too; changed_paths ignores them.
 pub def scan(root : String) : String
-  r = clean_path(root)
+  r = clean_path(File.expand_path(clean_path(root)))   # exactly the Store root form
   files = [] of String
   files << r + "/projects.toml"
   if Dir.exists?(r)
@@ -82,10 +82,13 @@ pub def merge(base_title : String, base_notes : String,
               mine_title : String, mine_notes : String,
               outside_title : String, outside_notes : String) : Merge
   title = merge_title(base_title, mine_title, outside_title)
+  if outside_notes == mine_notes
+    return Merge.new(title[0], mine_notes, title[1])
+  end
   if outside_notes == base_notes
     return Merge.new(title[0], mine_notes, title[1])
   end
-  if outside_notes.starts_with?(base_notes) && mine_notes != base_notes
+  if !base_notes.empty? && outside_notes.starts_with?(base_notes) && mine_notes != base_notes
     return Merge.new(title[0], mine_notes + outside_notes[base_notes.bytesize, outside_notes.bytesize - base_notes.bytesize], title[1])
   end
   if mine_notes == base_notes
@@ -104,7 +107,13 @@ end
 # shortcut: a failing disk write still panics (iyi has no non-raising File.write); only an unknown task is an error value.
 pub def write_conflict(store : Store, outside_text : String, id : String, now : Time) : String | WriteError
   t = store.find(id) || return WriteError.new("unknown task " + id)
-  path = File.dirname(store.path_of(t)) + "/" + id + ".conflict-" + now.to_utc.to_s("%Y%m%d%H%M%S") + ".md"
+  stem = File.dirname(store.path_of(t)) + "/" + id + ".conflict-" + now.to_utc.to_s("%Y%m%d%H%M%S")
+  path = stem + ".md"
+  n = 2
+  while File.exists?(path)
+    path = stem + "-" + n.to_s + ".md"
+    n += 1
+  end
   Loser::Paths.write_atomic(path, outside_text)
   path
 end
