@@ -120,6 +120,8 @@ jobs:
         run: |
           irm https://raw.githubusercontent.com/iyilang/iyi/v$env:IYI_VERSION/install.ps1 | iex
           "$env:LOCALAPPDATA\Programs\iyi\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Module files are tidy
+        run: iyi mod tidy --check
       - name: MSVC dev shell
         uses: ilammy/msvc-dev-cmd@v1
       - name: Build loser.exe
