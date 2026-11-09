@@ -1,0 +1,93 @@
+# projects.toml: the list of projects, an array of [[project]] tables.
+
+module loser/projects
+
+import std/toml::{TOML, TOMLError}
+import std/file::{File}
+import std/text
+import loser/paths
+
+pub class Project
+  property key : String, name : String, repo : String?
+
+  def initialize(@key : String, @name : String)
+    @repo = nil
+  end
+end
+
+# [] when the file is missing; the error text when it exists but cannot be read,
+# so a later save never wipes a hand-edited file. Entries without key or name are skipped.
+pub def load_projects(root : String) : Array(Project) | String
+  path = root + "/projects.toml"
+  out_list = [] of Project
+  return out_list unless File.exists?(path)
+  doc = TOML.parse(File.read(path))
+  return "projects.toml: " + doc.message if doc.is_a?(TOMLError)
+  list = doc["project"]?
+  return out_list if list.nil?
+  items = list.as_a? || return "projects.toml: 'project' must be an array of tables"
+  items.each do |item|
+    k = item["key"]?
+    n = item["name"]?
+    next if k.nil? || n.nil?
+    ks = k.as_s? || next
+    ns = n.as_s? || next
+    p = Project.new(ks, ns)
+    if r = item["repo"]?
+      p.repo = r.as_s?
+    end
+    out_list << p
+  end
+  out_list
+end
+
+pub def save_projects(root : String, ps : Array(Project)) : Nil
+  rows = ps.map do |p|
+    row = {"key" => p.key, "name" => p.name}
+    if r = p.repo
+      row["repo"] = r
+    end
+    row
+  end
+  text = TOML.dump(TOML.to_any({"project" => rows}))
+  Loser::Paths.write_atomic(root + "/projects.toml", text)
+end
+
+# "owner/name", [A-Za-z0-9_.-] on both sides.
+pub def valid_repo?(repo : String) : Bool
+  parts = repo.split('/')
+  return false unless parts.size == 2
+  parts.all? { |s| !s.empty? && s.chars.all? { |c| c.ascii_alphanumeric? || c == '_' || c == '.' || c == '-' } }
+end
+
+def ascii_letter(c : Char) : Char
+  case c
+  when 'ç', 'Ç' then 'c'
+  when 'ğ', 'Ğ' then 'g'
+  when 'ı', 'İ' then 'i'
+  when 'ö', 'Ö' then 'o'
+  when 'ş', 'Ş' then 's'
+  when 'ü', 'Ü' then 'u'
+  else c
+  end
+end
+
+pub def derive_key(name : String, taken : Array(String)) : String
+  s = ""
+  name.chars.each do |ch|
+    c = ascii_letter(ch)
+    if c.ascii_alphanumeric?
+      s += c.downcase.to_s
+    elsif !s.empty? && !s.ends_with?("-")
+      s += "-"
+    end
+  end
+  s = s.chomp("-")
+  s = "project" if s.empty?
+  return s unless taken.includes?(s)
+  n = 2
+  while taken.includes?(s + "-" + n.to_s)
+    n += 1
+  end
+  s + "-" + n.to_s
+end

@@ -1,0 +1,68 @@
+module test/projects_test
+
+import std/file::{File}
+import loser/projects
+import loser/testkit
+import github.com/tuntii/kilim/kilim/testing::*
+
+def loaded(root : String) : Array(Loser::Projects::Project)
+  r = Loser::Projects.load_projects(root)
+  return r if r.is_a?(Array(Loser::Projects::Project))
+  raise "load failed: " + r.to_s
+end
+
+def main : Int32
+  expect_eq(Loser::Projects.derive_key("Kilim GUI", [] of String), "kilim-gui", "plain")
+  expect_eq(Loser::Projects.derive_key("Çalışma Şöğüt", [] of String), "calisma-sogut", "turkish")
+  expect_eq(Loser::Projects.derive_key("İstanbul Iğdır", [] of String), "istanbul-igdir", "dotted I")
+  expect_eq(Loser::Projects.derive_key("Café ä", [] of String), "caf", "other non-ASCII is a separator")
+  expect_eq(Loser::Projects.derive_key("!!!", [] of String), "project", "empty")
+  expect_eq(Loser::Projects.derive_key("kilim", ["kilim", "kilim-2"]), "kilim-3", "taken")
+  expect_eq(Loser::Projects.derive_key("  a__b--c  ", [] of String), "a-b-c", "runs and trim")
+
+  expect(Loser::Projects.valid_repo?("Tuntii/kilim"), "valid repo")
+  expect(Loser::Projects.valid_repo?("a.b_c-d/e.f"), "valid chars")
+  ["Tuntii", "a/b/c", "a b/c", "/c", "a/", ""].each do |r|
+    expect(!Loser::Projects.valid_repo?(r), "invalid repo " + r.inspect)
+  end
+
+  root = Loser::Testkit.temp_root("projects_missing")
+  expect_eq(loaded(root).size, 0, "missing file is empty")
+
+  a = Loser::Projects::Project.new("kilim", "Kilim \"GUI\" \ çğ")
+  a.repo = "Tuntii/kilim"
+  b = Loser::Projects::Project.new("notes", "Notes")
+  Loser::Projects.save_projects(root, [a, b])
+  expect(!File.exists?(root + "/projects.toml.tmp"), "no tmp left")
+  back = loaded(root)
+  expect_eq(back.size, 2, "two back")
+  expect_eq(back[0].key, "kilim", "key 0")
+  expect_eq(back[0].name, a.name, "name 0")
+  expect_eq(back[0].repo || "", "Tuntii/kilim", "repo 0")
+  expect_eq(back[1].key, "notes", "key 1")
+  expect_eq(back[1].name, "Notes", "name 1")
+  expect(back[1].repo.nil?, "repo 1 nil")
+  expect(File.read(root + "/projects.toml").includes?("[[project]]"), "array of tables")
+
+  crlf = Loser::Testkit.temp_root("projects_crlf")
+  File.write(crlf + "/projects.toml", "# my projects\r\n[[project]]\r\nkey = \"a\" # k\r\nname = \"A\"\r\nrepo = \"o/a\"\r\n\r\n[[project]]\r\nkey = \"b\"\r\nname = \"B\"\r\n")
+  c = loaded(crlf)
+  expect_eq(c.size, 2, "crlf count")
+  expect_eq(c[0].repo || "", "o/a", "crlf repo")
+  expect_eq(c[1].name, "B", "crlf name")
+
+  skip = Loser::Testkit.temp_root("projects_skip")
+  File.write(skip + "/projects.toml", "[[project]]\nname = \"no key\"\n[[project]]\nkey = \"nn\"\n[[project]]\nkey = \"ok\"\nname = \"Ok\"\n")
+  s = loaded(skip)
+  expect_eq(s.size, 1, "entries without key or name skipped")
+  expect_eq(s[0].key, "ok", "kept entry")
+
+  bad = Loser::Testkit.temp_root("projects_bad")
+  File.write(bad + "/projects.toml", "[[project]]\nkey = \"a\nname = \n")
+  r = Loser::Projects.load_projects(bad)
+  expect(r.is_a?(String), "broken file answers an error text")
+  expect(File.read(bad + "/projects.toml").starts_with?("[[project]]"), "broken file untouched")
+  0
+end
+
+exit main
