@@ -288,6 +288,8 @@ pub class Server
     more = a.str("append_notes")
     return {"", true} unless a.errors.empty?
     t = @store.find(id || "") || return {"unknown task " + (id || ""), true}
+    # a GUI autosave since the load at the start of this call counts: read the file again
+    t = @store.reload_file(@store.path_of(t)) || return {"cannot read the file of " + (id || ""), true}
     if (title || labels) && t.github?
       return {t.id + " comes from GitHub: its title and labels are GitHub's", true}
     end
