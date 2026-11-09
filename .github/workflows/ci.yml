@@ -35,3 +35,68 @@ jobs:
         run: iyi mod tidy --check
       - name: Test
         run: iyi test
+
+      # --- GUI self-test: Windows native backend; SDL3 on Linux (xvfb) and macOS ---
+      - name: MSVC dev shell
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # kilim's scripts build SDL; built from the tag loser requires.
+      - name: Check out kilim (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/checkout@v4
+        with:
+          repository: Tuntii/kilim
+          ref: v0.2.0
+          path: kilim-src
+      - name: Build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build xvfb libx11-dev libxext-dev libxrandr-dev \
+            libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libgl-dev libegl-dev
+      - name: Cache SDL (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: kilim-src/vendor/linux
+          key: sdl-linux-${{ hashFiles('kilim-src/scripts/sdl-versions.txt', 'kilim-src/scripts/build-sdl-linux.sh') }}
+      # Installs into /usr/local and runs ldconfig: cc links and the program loads without extra paths.
+      - name: SDL (Linux)
+        if: runner.os == 'Linux'
+        run: bash kilim-src/scripts/build-sdl-linux.sh
+
+      - name: SDL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install sdl3 sdl3_ttf
+          # Homebrew's lib directory is not on cc's default search path.
+          echo "IYI_LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+
+      # Default video driver first; offscreen if SDL cannot open a window.
+      - name: GUI self-test
+        shell: bash
+        env:
+          LOSER_SELFTEST: loser.bmp
+          SDL_RENDER_DRIVER: software
+        run: |
+          wrap=""
+          [ "$RUNNER_OS" = Linux ] && wrap="xvfb-run -a"
+          if $wrap iyi run main.iyi 2>&1 | tee selftest.log && grep -q "loser selftest: ok" selftest.log; then
+            echo "video driver: default"
+          elif grep -qE 'kilim: SDL_(Init|CreateWindow|CreateRenderer)' selftest.log; then
+            echo "window could not be opened, retrying with SDL_VIDEO_DRIVER=offscreen"
+            SDL_VIDEO_DRIVER=offscreen iyi run main.iyi | tee selftest.log
+            grep -q "loser selftest: ok" selftest.log
+          else
+            exit 1
+          fi
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loser-${{ matrix.os }}
+          path: loser.bmp
+          if-no-files-found: warn
