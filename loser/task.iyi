@@ -1,0 +1,127 @@
+# Task files: YAML front matter, then the notes as plain text.
+
+module loser/task
+
+import std/yaml::{YAML, Any}
+import std/json::{JSON}
+
+pub STATUSES = ["todo", "doing", "done"]
+
+pub def status_title(s : String) : String
+  case s
+  when "doing" then "Doing"
+  when "done"  then "Done"
+  else "To do"
+  end
+end
+
+pub class Task
+  property id : String, title : String, status : String, labels : Array(String),
+           github : String?, github_kind : String?, github_state : String?,
+           updated : String, hidden : Bool, notes : String
+
+  def initialize(@id : String, @title : String)
+    @status = "todo"
+    @labels = [] of String
+    @github = nil
+    @github_kind = nil
+    @github_state = nil
+    @updated = ""
+    @hidden = false
+    @notes = ""
+  end
+
+  pub def github? : Bool
+    !@github.nil?
+  end
+end
+
+# nil when the text has no readable front matter or lacks id or title.
+pub def parse_task(text : String) : Task?
+  text = text[3, text.bytesize] if text.starts_with?("\uFEFF")
+  lines = text.gsub("\r\n", "\n").split("\n")
+  return nil unless lines[0] == "---"
+  close = 1
+  while close < lines.size && lines[close] != "---"
+    close += 1
+  end
+  return nil if close >= lines.size
+  fm = lines[1...close].join("\n") + "\n"
+  doc = YAML.parse?(fm) || return nil
+  map = doc.as_h? || return nil
+  return nil if map.empty?
+  id = field_s(doc, "id", fm) || return nil
+  title = field_s(doc, "title", fm) || return nil
+  t = Task.new(id, title)
+  st = field_s(doc, "status", fm) || "todo"
+  t.status = STATUSES.includes?(st) ? st : "todo"
+  if lv = doc["labels"]?
+    if arr = lv.as_a?
+      arr.each { |l| (s = scalar_s(l)) && t.labels << s }
+    elsif s = scalar_s(lv)
+      t.labels << s
+    end
+  end
+  t.github = field_s(doc, "github", fm)
+  t.github_kind = field_s(doc, "github_kind", fm)
+  t.github_state = field_s(doc, "github_state", fm)
+  t.updated = field_s(doc, "updated", fm) || ""
+  t.hidden = (doc["hidden"]? && doc["hidden"].as_bool?) || false
+  t.notes = lines[(close + 1)...lines.size].join("\n")
+  t
+end
+
+pub def render_task(t : Task) : String
+  s = "---\n"
+  s += "id: " + JSON.to_json(t.id) + "\n"
+  s += "title: " + JSON.to_json(t.title) + "\n"
+  s += "status: " + JSON.to_json(t.status) + "\n"
+  s += "labels: " + JSON.to_json(t.labels) + "\n"
+  if g = t.github
+    s += "github: " + JSON.to_json(g) + "\n"
+  end
+  if k = t.github_kind
+    s += "github_kind: " + JSON.to_json(k) + "\n"
+  end
+  if st = t.github_state
+    s += "github_state: " + JSON.to_json(st) + "\n"
+  end
+  s += "updated: " + JSON.to_json(t.updated) + "\n"
+  s += "hidden: " + (t.hidden ? "true" : "false") + "\n"
+  s + "---\n" + t.notes
+end
+
+# shortcut: label elements inside a flow list use the parsed value (2024.10 reads as 2024.1); take source text if that matters.
+# A scalar read as text: strings as they are, numbers and booleans by their value.
+def scalar_s(v : Any) : String?
+  if s = v.as_s?
+    s
+  elsif i = v.as_i?
+    i.to_s
+  elsif f = v.as_f?
+    f.to_s
+  elsif b = v.as_bool?
+    b.to_s
+  end
+end
+
+# A string as it is; a number or bool as the text the file spells (2024.10 stays 2024.10).
+# shortcut: a duplicated or indented key is not looked for, the first `key:` line at column 0 wins.
+def field_s(doc : Any, key : String, fm : String) : String?
+  v = doc[key]?
+  return nil if v.nil?
+  if s = v.as_s?
+    return s
+  end
+  return nil unless scalar_s(v)
+  fm.split("\n").each do |line|
+    if line.starts_with?(key + ":")
+      rest = line[key.bytesize + 1, line.bytesize]
+      if c = rest.index(" #")
+        rest = rest[0, c]
+      end
+      return rest.strip
+    end
+  end
+  scalar_s(v)
+end

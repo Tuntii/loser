@@ -1,0 +1,82 @@
+module test/task_test
+
+import loser/task
+import github.com/tuntii/kilim/kilim/testing::*
+
+SAMPLE = "---\nid: kilim-12            # GitHub: <key>-<number>; local: <key>-<yyyymmddhhmmss><3 random letters>\ntitle: Quick start on its own page\nstatus: doing           # todo | doing | done\nlabels: [docs]\ngithub: Tuntii/kilim#12 # absent for local tasks\ngithub_kind: pr         # issue | pr\ngithub_state: open      # as last seen on GitHub\nupdated: 2026-11-06T10:00:00Z\nhidden: false           # a deleted GitHub task stays hidden instead of coming back\n---\nNotes, as plain Markdown text.\n"
+
+def main : Int32
+  t = Loser::Task::Task.new("kilim-12", "Fix: \"quoted\" #12 — çğıöşü İ")
+  t.labels = ["docs", "a b"]
+  t.notes = "line 1\n---\nline 3\n"
+  t.github = "Tuntii/kilim#12"
+  t.github_kind = "pr"
+  t.github_state = "open"
+  t.updated = "2026-11-06T10:00:00Z"
+  t.status = "doing"
+  t.hidden = true
+  back = Loser::Task.parse_task(Loser::Task.render_task(t)) || raise("round trip gave nil")
+  expect_eq(back.id, t.id, "id")
+  expect_eq(back.title, t.title, "title")
+  expect_eq(back.status, "doing", "status")
+  expect_eq(back.labels, t.labels, "labels")
+  expect_eq(back.github || "", "Tuntii/kilim#12", "github")
+  expect_eq(back.github_kind || "", "pr", "kind")
+  expect_eq(back.github_state || "", "open", "state")
+  expect_eq(back.updated, t.updated, "updated")
+  expect_eq(back.hidden, true, "hidden")
+  expect_eq(back.notes, t.notes, "notes")
+  expect(back.github?, "github? true")
+  expect_eq(Loser::Task.render_task(back), Loser::Task.render_task(t), "render is stable")
+
+  local = Loser::Task::Task.new("k-1", "Local")
+  expect(!Loser::Task.render_task(local).includes?("github"), "local task has no github line")
+  expect(!local.github?, "github? false")
+  expect_eq(Loser::Task.render_task(local).ends_with?("---\n"), true, "empty notes, no extra newline")
+
+  s = Loser::Task.parse_task(SAMPLE) || raise("sample is nil")
+  expect_eq(s.id, "kilim-12", "sample id")
+  expect_eq(s.status, "doing", "sample status")
+  expect_eq(s.labels, ["docs"], "sample labels")
+  expect_eq(s.notes, "Notes, as plain Markdown text.\n", "sample notes")
+  expect_eq(s.updated, "2026-11-06T10:00:00Z", "sample updated")
+
+  crlf = Loser::Task.parse_task("\uFEFF" + SAMPLE.gsub("\n", "\r\n")) || raise("crlf is nil")
+  expect_eq(Loser::Task.render_task(crlf), Loser::Task.render_task(s), "CRLF and BOM read the same")
+
+  b = Loser::Task.parse_task("---\nid: a\ntitle: b\nstatus: blocked\n---\n") || raise("blocked is nil")
+  expect_eq(b.status, "todo", "unknown status is todo")
+  expect_eq(b.updated, "", "missing updated is empty")
+  expect_eq(b.hidden, false, "missing hidden")
+
+  n = Loser::Task.parse_task("---\nid: 12\ntitle: 2024\nlabels: [2024, docs]\nstatus: 5\n---\n") || raise("numeric is nil")
+  expect_eq(n.id, "12", "numeric id")
+  expect_eq(n.title, "2024", "numeric title")
+  expect_eq(n.labels, ["2024", "docs"], "numeric label")
+  expect_eq(n.status, "todo", "numeric status")
+  expect_eq((Loser::Task.parse_task("---\nid: a\ntitle: true\n---\n") || raise("bool")).title, "true", "bool title")
+  expect_eq((Loser::Task.parse_task("---\nid: a\ntitle: 3.5\n---\n") || raise("float")).title, "3.5", "float title")
+  expect_eq((Loser::Task.parse_task("---\nid: a\ntitle: b\nlabels: docs\n---\n") || raise("scalar labels")).labels, ["docs"], "scalar labels")
+  ["a\nb", ""].each do |notes|
+    r = Loser::Task::Task.new("k-2", "T")
+    r.notes = notes
+    expect_eq((Loser::Task.parse_task(Loser::Task.render_task(r)) || raise("rt")).notes, notes, "notes round trip " + notes.inspect)
+  end
+
+  ["title: 2024.10|2024.10", "title: 1e2|1e2", "title: 3.5  # comment|3.5", "title: 0x1F|0x1F"].each do |c|
+    parts = c.split("|")
+    x = Loser::Task.parse_task("---\nid: a\n" + parts[0] + "\n---\n") || raise("src nil")
+    expect_eq(x.title, parts[1], "source text of " + parts[0])
+  end
+  expect_eq((Loser::Task.parse_task("---\nid: 012\ntitle: b\n---\n") || raise("id012")).id, "012", "id 012")
+
+  expect(Loser::Task.parse_task("---\nid: a\ntitle: b\n").nil?, "no closing ---")
+  expect(Loser::Task.parse_task("---\nid: a\ntitle: [\n---\n").nil?, "invalid yaml")
+  expect(Loser::Task.parse_task("---\nid: a\n---\n").nil?, "missing title")
+  expect(Loser::Task.parse_task("just text").nil?, "no front matter")
+  expect_eq(Loser::Task.status_title("doing"), "Doing", "status_title")
+  expect_eq(Loser::Task::STATUSES.size, 3, "STATUSES")
+  0
+end
+
+exit main
