@@ -1,0 +1,93 @@
+# Task files: YAML front matter, then the notes as plain text.
+
+module loser/task
+
+import std/yaml::{YAML, Any}
+import std/json::{JSON}
+
+pub STATUSES = ["todo", "doing", "done"]
+
+pub def status_title(s : String) : String
+  case s
+  when "doing" then "Doing"
+  when "done"  then "Done"
+  else "To do"
+  end
+end
+
+pub class Task
+  property id : String, title : String, status : String, labels : Array(String),
+           github : String?, github_kind : String?, github_state : String?,
+           updated : String, hidden : Bool, notes : String
+
+  def initialize(@id : String, @title : String)
+    @status = "todo"
+    @labels = [] of String
+    @github = nil
+    @github_kind = nil
+    @github_state = nil
+    @updated = ""
+    @hidden = false
+    @notes = ""
+  end
+
+  pub def github? : Bool
+    !@github.nil?
+  end
+end
+
+# nil when the text has no readable front matter or lacks id or title.
+pub def parse_task(text : String) : Task?
+  text = text[3, text.bytesize] if text.starts_with?("﻿")
+  lines = text.gsub("\r\n", "\n").split("\n")
+  return nil unless lines[0] == "---"
+  close = 1
+  while close < lines.size && lines[close] != "---"
+    close += 1
+  end
+  return nil if close >= lines.size
+  doc = YAML.parse?(lines[1...close].join("\n") + "\n") || return nil
+  map = doc.as_h? || return nil
+  return nil if map.empty?
+  id = field_s(doc, "id") || return nil
+  title = field_s(doc, "title") || return nil
+  t = Task.new(id, title)
+  st = field_s(doc, "status") || "todo"
+  t.status = STATUSES.includes?(st) ? st : "todo"
+  if labels = (doc["labels"]? && doc["labels"].as_a?)
+    labels.each { |l| (s = l.as_s?) && t.labels << s }
+  end
+  t.github = field_s(doc, "github")
+  t.github_kind = field_s(doc, "github_kind")
+  t.github_state = field_s(doc, "github_state")
+  t.updated = field_s(doc, "updated") || ""
+  t.hidden = (doc["hidden"]? && doc["hidden"].as_bool?) || false
+  t.notes = lines[(close + 1)...lines.size].join("\n")
+  t
+end
+
+pub def render_task(t : Task) : String
+  s = "---\n"
+  s += "id: " + JSON.to_json(t.id) + "\n"
+  s += "title: " + JSON.to_json(t.title) + "\n"
+  s += "status: " + JSON.to_json(t.status) + "\n"
+  s += "labels: " + JSON.to_json(t.labels) + "\n"
+  if g = t.github
+    s += "github: " + JSON.to_json(g) + "\n"
+  end
+  if k = t.github_kind
+    s += "github_kind: " + JSON.to_json(k) + "\n"
+  end
+  if st = t.github_state
+    s += "github_state: " + JSON.to_json(st) + "\n"
+  end
+  s += "updated: " + JSON.to_json(t.updated) + "\n"
+  s += "hidden: " + (t.hidden ? "true" : "false") + "\n"
+  s + "---\n" + t.notes
+end
+
+def field_s(doc : Any, key : String) : String?
+  if v = doc[key]?
+    v.as_s?
+  end
+end
