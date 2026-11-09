@@ -6,13 +6,15 @@ loser is a desktop project tracker for your own projects: three panes (projects,
 
 Download `loser.exe` from the [latest release](https://github.com/Tuntii/loser/releases/latest) and put it in a folder on your `PATH`. Double-click it, or run `loser` in a terminal, to open the window.
 
+`loser.exe` needs `VCRUNTIME140.dll`, which a clean Windows does not have: if it does not start, install the Microsoft Visual C++ Redistributable (x64) from Microsoft's download page.
+
 ## Use it from Claude
 
 ```
-claude mcp add loser -- loser mcp
+claude mcp add -s user loser -- loser mcp
 ```
 
-`loser mcp` speaks MCP over stdio. It reads and writes the same files as the window, so the window does not need to be open; if it is, it picks up the changes within two seconds. Tools: `list_projects`, `list_tasks`, `get_task`, `create_task`, `update_task`, `sync`.
+`-s user` makes it available in every project. `loser mcp` speaks MCP over stdio. It reads and writes the same files as the window, so the window does not need to be open; if it is, it picks up the changes within two seconds. Tools: `list_projects`, `list_tasks`, `get_task`, `create_task`, `update_task`, `sync`.
 
 ## Where your data lives
 
@@ -50,7 +52,7 @@ Writes are atomic, and the window reloads files that change outside it (a `git p
 
 Link a project to a repo (New project, or `repo` in `projects.toml`) and loser pulls its open issues and pull requests into To do. It needs the [GitHub CLI](https://cli.github.com/) logged in with `gh auth login`; loser only runs `gh` and never stores a token.
 
-Sync is read-only: GitHub owns the title and labels of its tasks, closing or merging moves a task to Done, and your notes and Doing status are never overwritten. It runs every 5 minutes, with the Sync button, with `loser sync`, and through the MCP `sync` tool.
+Sync is read-only: GitHub owns the title and labels of its tasks, your notes are never overwritten, an open issue never moves a Doing task back, and closing or merging moves a task to Done. It runs every 5 minutes, with the Sync button, with `loser sync`, and through the MCP `sync` tool.
 
 ## Keyboard
 
