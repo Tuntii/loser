@@ -141,7 +141,8 @@ pub class Store
     dir = @root + "/" + key
     return unless Dir.exists?(dir)
     Dir.children(dir).sorted.each do |name|
-      next if ignored_file?(name)
+      # a folder named x.md is no task file (File.read would panic on it)
+      next if ignored_file?(name) || !File.file?(dir + "/" + name)
       read_into(key, dir + "/" + name)
     end
   end
@@ -226,12 +227,16 @@ pub class Store
   # A task the store does not know is ignored.
   pub def delete(t : Task) : Nil
     return unless @paths.has_key?(t.id)
+    path = @paths[t.id]
     if t.github?
-      t.hidden = true
-      save(t)
+      # read again: notes appended outside a moment ago stay in the hidden file
+      cur = reload_file(path)
+      return if cur.nil? && File.exists?(path)   # unreadable: never overwritten
+      h = cur || t
+      h.hidden = true
+      save(h)
       return
     end
-    path = @paths[t.id]
     File.delete(path) if File.exists?(path)
     forget(t.id)
   end
@@ -294,7 +299,7 @@ pub class Store
       forget(oid)
     end
     # shortcut: an editor's delete-then-rename can remove the file between this check and the read, which panics; iyi has no non-raising File.read.
-    unless File.exists?(p)
+    unless File.file?(p)
       @file_errors.delete(key + "/" + name)
       @stamps.delete(p)
       return nil

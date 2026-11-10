@@ -1,0 +1,42 @@
+# A double-clicked loser.exe gets a console of its own, which would sit behind the window.
+# Started from a terminal, the console is shared with the shell and stays.
+#
+# Freeing the console alone is not enough: `gh`, started by Process.run, would then get a new,
+# visible console of its own. Hiding the console alone is not enough either: when Windows Terminal
+# is the default terminal, the console's window is a stand-in and the Terminal window stays.
+# So the owned console (conhost or Terminal) is freed, and a new plain conhost console is made
+# and hidden at once; children inherit that hidden console.
+
+module loser/console
+
+{% if flag?(:win32) %}
+  @[Link("kernel32")]
+  lib ::LibConsole
+    fun GetConsoleProcessList(list : UInt32*, count : UInt32) : UInt32
+    fun FreeConsole : Int32
+    fun AllocConsole : Int32
+    fun GetConsoleWindow : Void*
+  end
+
+  @[Link("user32")]
+  lib ::LibConsoleUser
+    fun ShowWindow(hwnd : Void*, cmd : Int32) : Int32
+  end
+
+  SW_HIDE = 0
+
+  pub def detach_if_owned : Nil
+    pid = 0_u32
+    # 1: only this process is attached; 0: no console at all; more: shared with a shell
+    if LibConsole.GetConsoleProcessList(pointerof(pid), 1_u32) == 1_u32
+      LibConsole.FreeConsole
+      LibConsole.AllocConsole
+      LibConsoleUser.ShowWindow(LibConsole.GetConsoleWindow, SW_HIDE)
+    end
+    nil
+  end
+{% else %}
+  pub def detach_if_owned : Nil
+    nil
+  end
+{% end %}

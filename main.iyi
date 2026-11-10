@@ -3,13 +3,14 @@ module main
 import std/env::{ENV}
 import std/file::{File}
 import std/dir::{Dir}
+import loser/console
 import loser/paths
 import loser/mcp
 import loser/sync
 import loser/testkit
 import loser/changes
 import loser/store::{Store}
-import loser/task::{Task, render_task}
+import loser/task::{Task, render_task, parse_task}
 import std/time::{Time}
 import loser/gui/app::{App}
 import loser/gui/forms::{new_project_form}
@@ -340,8 +341,54 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   app.on_message("sync\nGitHub: not logged in (run gh auth login)")
   fail("sync summary not shown: " + app.status_line.text.inspect) unless app.status_line.text == "GitHub: not logged in (run gh auth login)"
 
-  # A git pull of 200 new files plus the selected task: reloaded in slices across frames, the selected task first.
+  # An outside append (MCP append_notes) lands, then a status is picked before the scan comes:
+  # the file gets both, the pick is not reverted to the file's status.
+  choose(win, app.tasks, ship)
+  Loser::Paths.write_atomic(task_path(ship), file_of(ship) + "appended by mcp\n")
+  click(win, app.status)
+  press(win, Key::Up)
+  press(win, Key::Enter)
+  fail("picked status reverted: " + app.status.selected.to_s) unless app.status.selected == 1
+  fail("pick lost the append:\n" + file_of(ship)) unless file_of(ship).includes?("status: \"doing\"") && file_of(ship).ends_with?("appended by mcp\n")
+
+  # Labels being typed survive an outside append to the notes; both reach the file.
   bw = row_key(app, "Build the window")
+  choose(win, app.tasks, bw)
+  click(win, app.labels)
+  press(win, Key::End)
+  win.inject TextInput.new(", urgent")
+  Loser::Paths.write_atomic(task_path(bw), file_of(bw) + "appended to bw\n")
+  sleep(550)
+  win.step
+  fail("typed labels reverted: " + app.labels.text.inspect) unless app.labels.text == "gui, kilim, urgent"
+  fail("labels or append lost:\n" + file_of(bw)) unless file_of(bw).includes?("\"urgent\"") && file_of(bw).includes?("\"gui\"") && file_of(bw).ends_with?("appended to bw\n")
+
+  # Both rewrote the labels: mine are saved, the outside version goes to a conflict file.
+  press(win, Key::End)
+  win.inject TextInput.new(", mine")
+  theirs = parse_task(file_of(bw)) || fail("bw unreadable")
+  theirs.labels = ["theirs"]
+  Loser::Paths.write_atomic(task_path(bw), render_task(theirs))
+  sleep(550)
+  win.step
+  fail("label conflict, status line: " + app.status_line.text.inspect) unless app.status_line.text.starts_with?("Saved your text; the other version is in " + bw + ".conflict-")
+  fail("my labels lost:\n" + file_of(bw)) unless file_of(bw).includes?("\"mine\"") && !file_of(bw).includes?("\"theirs\"")
+
+  # A title field emptied to retype it: the autosave keeps the saved title and the field stays empty.
+  click(win, app.title)
+  ctrl(win, Key::A)
+  press(win, Key::Backspace)
+  sleep(550)
+  win.step
+  fail("emptied title saved:\n" + file_of(bw)) unless file_of(bw).includes?("title: \"Build the window\"")
+  fail("task gone after emptying its title") unless titles(app).includes?("Build the window")
+  fail("emptied title field refilled: " + app.title.text.inspect) unless app.title.text.empty?
+  win.inject TextInput.new("Build the window again")
+  sleep(550)
+  win.step
+  fail("retyped title not saved:\n" + file_of(bw)) unless file_of(bw).includes?("title: \"Build the window again\"")
+
+  # A git pull of 200 new files plus the selected task: reloaded in slices across frames, the selected task first.
   choose(win, app.tasks, bw)
   200.times do |i|
     t = Task.new("alpha-bulk" + (1000 + i).to_s, "Pulled " + i.to_s)
@@ -370,6 +417,22 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("a reload pass took over 100 ms") if first > 100 || worst > 100
   fail("200 pulled tasks not listed: " + titles(app).size.to_s) unless titles(app).size == 202
 
+  # A same-second, same-size outside write (MCP flips todo to done) to the task being edited:
+  # its stamp looks unchanged, yet the next autosave keeps the file's status.
+  pulled = "alpha-bulk1000"
+  choose(win, app.tasks, pulled)
+  pp = task_path(pulled)
+  st0 = Loser::Store.file_stamp(pp) || fail("no stamp")
+  Loser::Paths.write_atomic(pp, file_of(pulled).sub("status: \"todo\"", "status: \"done\""))
+  File.touch(pp, st0[0] // 1000000000_i64)
+  fail("flip changed the stamp, the step tests nothing") unless Loser::Store.file_stamp(pp) == st0
+  click(win, app.notes)
+  press(win, Key::End)
+  win.inject TextInput.new("typed after the flip")
+  sleep(550)
+  win.step
+  fail("same-stamp status reverted:\n" + file_of(pulled)) unless file_of(pulled).includes?("status: \"done\"") && file_of(pulled).includes?("typed after the flip")
+
   win.step
   win.screenshot(bmp)
   fail("no screenshot") unless File.exists?(bmp)
@@ -388,6 +451,7 @@ if cmd == "sync"
   exit(summary.includes?(" new, ") && !summary.includes?("; ") ? 0 : 1)
 end
 
+Loser::Console.detach_if_owned unless ENV["LOSER_SELFTEST"]?
 bmp = ENV["LOSER_SELFTEST"]?
 if bmp
   # never the real ~/loser

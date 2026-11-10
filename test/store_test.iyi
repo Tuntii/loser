@@ -81,6 +81,15 @@ def main : Int32
   st3.load
   expect(!st3.tasks("kilim").any? { |t| t.id == g.id }, "hidden stays hidden after load")
 
+  # GitHub task: delete reads the file first, so notes appended outside are kept
+  g2 = mk(st, "kilim", "Also from GitHub", "mine\n", "todo", [] of String, now)
+  g2.github = "Tuntii/kilim#13"
+  st.save(g2, now)
+  File.write(st.path_of(g2), File.read(st.path_of(g2)) + "appended outside\n")
+  st.delete(g2)
+  expect(File.read(st.path_of(g2)).ends_with?("mine\nappended outside\n"), "github delete keeps an outside append")
+  expect(File.read(st.path_of(g2)).includes?("hidden: true"), "github delete still hides")
+
   # reload_file
   p = st3.path_of(c)
   File.write(p, File.read(p).sub("title: \"Mid\"", "title: \"Mid2\""))
@@ -105,6 +114,13 @@ def main : Int32
   expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by load")
   other = mk(s4, "kilim", "Other", "", "todo", [] of String, now)
   s4.save(other, now)
+
+  # a folder named like a task file is no task file
+  Dir.mkdir_p(r2 + "/kilim/dir.md")
+  s4b = Loser::Store::Store.new(r2)
+  s4b.load
+  expect_eq(s4b.tasks("kilim").size, 1, "a dir.md folder does not break load")
+  expect(s4b.reload_file(r2 + "/kilim/dir.md").nil?, "reload of a dir.md folder")
   expect_eq(File.read(r2 + "/kilim/bad.md"), "no front matter here\n", "bad.md untouched by save")
 
   # add_project
