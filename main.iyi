@@ -383,6 +383,10 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("emptied title saved:\n" + file_of(bw)) unless file_of(bw).includes?("title: \"Build the window\"")
   fail("task gone after emptying its title") unless titles(app).includes?("Build the window")
   fail("emptied title field refilled: " + app.title.text.inspect) unless app.title.text.empty?
+  # a scan taken before that save, arriving after it: the file holds what I saved, nothing to refill
+  app.outside_changes(task_path(bw) + "\t0\t0")
+  win.step
+  fail("stale scan refilled the emptied title: " + app.title.text.inspect) unless app.title.text.empty?
   win.inject TextInput.new("Build the window again")
   sleep(550)
   win.step
