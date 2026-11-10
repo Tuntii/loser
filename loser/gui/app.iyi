@@ -18,7 +18,7 @@ import github.com/tuntii/kilim/kilim/dropdown::{Dropdown}
 import github.com/tuntii/kilim/kilim/event::{Key, Mods, KeyDown}
 import github.com/tuntii/kilim/kilim/window::{Window}
 import loser/store::{Store}
-import loser/task::{Task, STATUSES, status_title, parse_task}
+import loser/task::{Task, STATUSES, status_title, parse_task, render_task}
 import loser/projects::{Project}
 import loser/changes::{changed_paths, merge, write_conflict, WriteError}
 import loser/gui/worker::{Worker}
@@ -313,7 +313,7 @@ pub class App
   end
 
   # The worker's scan: queue what changed on disk since the store last saw it, the task being edited first.
-  def outside_changes(scan : String) : Nil
+  pub def outside_changes(scan : String) : Nil
     paths = changed_paths(@store, scan)
     return if paths.empty?
     @pending = (@pending + paths).uniq
@@ -336,9 +336,15 @@ pub class App
     flush if @dirty
     before = @store.errors
     cur = (t = current_task) ? @store.path_of(t) : nil
+    shown = (t = current_task) ? render_task(t) : nil
     slice.each { |p| @store.reload_file(p) }
     refresh
-    show_task if cur && slice.includes?(cur)
+    # A scan taken before my own save arrives as a change of a file that holds just what I saved:
+    # the fields are refilled only when the task really changed (an emptied title must stay empty).
+    if cur && slice.includes?(cur)
+      now = current_task
+      show_task if now.nil? || render_task(now) != shown
+    end
     errs = @store.errors
     say("Could not read: " + errs.join(", ")) unless errs.empty? || errs == before
     return if @pending.empty?
