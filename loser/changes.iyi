@@ -23,7 +23,7 @@ pub struct WriteError
 end
 
 # One line "<path>\t<mtime ns>\t<size>" for projects.toml and every <folder>/*.md of the root,
-# sorted by path. Plain files and directories only, no C calls: safe inside spawn_parallel.
+# sorted by path. Plain files and directories only, no C calls: safe inside `spawn(unit: :new)`.
 # Folders that are not projects are listed too; changed_paths ignores them. Dot-folders (.git, and
 # .sync.lock, which a sync removes at any moment) and entries that are not regular files are skipped.
 pub def scan(root : String) : String
