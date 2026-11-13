@@ -69,7 +69,7 @@ Sync is read-only: GitHub owns the title and labels of its tasks, your notes are
 iyi build --release main.iyi -o loser.exe
 ```
 
-Needs iyi 0.20.0. On Windows, run it from an MSVC developer prompt. On Linux and macOS loser uses kilim's SDL backend, so SDL3 and SDL3_ttf must be installed, as for kilim.
+Needs iyi 0.21.0. On Windows, run it from an MSVC developer prompt. On Linux and macOS loser uses kilim's SDL backend, so SDL3 and SDL3_ttf must be installed, as for kilim.
 
 `iyi test` runs the unit tests. The GUI self-test drives the real window and writes a screenshot:
 

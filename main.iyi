@@ -261,7 +261,7 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("notes after Delete: " + app.notes.text.inspect) unless app.notes.text == "x"
   app.flush
 
-  # Sync through the worker (spawn_parallel, then the inbox): no project is linked to a repo.
+  # Sync through the worker (`spawn(unit: :new)`, then the inbox): no project is linked to a repo.
   app.say("")
   click(win, app.sync_button)
   wait_status(win, app, NO_REPO)
@@ -471,7 +471,7 @@ worker = app.attach(win)
 app.on_new_project = -> { win.ui.show_modal(new_project_form(app)); nil }
 # The group joins the worker once the window is gone.
 group do |g|
-  g.spawn_parallel { worker.run; nil }
+  g.spawn(unit: :new) { worker.run; nil }
   if bmp
     selftest(win, app, bmp)
   else

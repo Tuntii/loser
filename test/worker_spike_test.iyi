@@ -8,13 +8,13 @@ import loser/paths
 import loser/testkit
 import github.com/tuntii/kilim/kilim/testing::*
 
-# Proof for the worker design: process, files and directories work inside spawn_parallel.
+# Proof for the worker design: process, files and directories work inside `spawn(unit: :new)`.
 def main : Int32
   dir = Loser::Testkit.temp_root("worker_spike")
   code = Atomic(Int32).new(-1)
   seen = Mutex.new { "" }
   group do |g|
-    g.spawn_parallel {
+    g.spawn(unit: :new) {
       r = Process.run("git", ["--version"])
       code.set(r.is_a?(ProcessResult) ? r.exit_code : 99)
       Loser::Paths.write_atomic(dir + "/w.md", "hi")

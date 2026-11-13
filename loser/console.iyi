@@ -7,6 +7,7 @@
 # So the owned console (conhost or Terminal) is freed, and a new plain conhost console is made
 # and hidden at once; children inherit that hidden console.
 
+@[Unsafe("calls the Windows console API")]
 module loser/console
 
 {% if flag?(:win32) %}

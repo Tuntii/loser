@@ -1,5 +1,5 @@
 # The background loop: scans the root every 2 s; syncs with GitHub at start, every 5 min
-# and on request. It runs inside spawn_parallel, so it holds only Share values, calls no
+# and on request. It runs inside `spawn(unit: :new)`, so it holds only Share values, calls no
 # C function and touches no widget: results go to the window as Strings through the inbox.
 
 module loser/gui/worker
