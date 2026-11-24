@@ -119,7 +119,8 @@ pub class App
     worker = Worker.new(@store.root, w.inbox(String) { |m| on_message(m); nil })
     @worker = worker
     w.shortcut(Key::N) { new_task; nil }
-    w.shortcut(Key::F) { w.ui.focus(@search); nil }
+    # the old query is selected, so typing replaces it
+    w.shortcut(Key::F) { w.ui.focus(@search); @search.select_all; nil }
     # not while a text field has focus: there Delete deletes a character
     w.shortcut(Key::Delete, primary: false) { delete_selected; nil }
     worker
@@ -373,9 +374,18 @@ pub class App
       conflict = m.conflict
       t.title = m.title
       t.notes = m.notes
-      @title.text = m.title unless t.github? || m.title == mine_title || @title.text == m.title
+      # a merged field keeps its caret index, so typing goes on where it was
+      unless t.github? || m.title == mine_title || @title.text == m.title
+        tc = @title.caret
+        @title.text = m.title
+        @title.caret = tc
+      end
       @title_ro.text = m.title
-      @notes.text = m.notes unless @notes.text == m.notes
+      unless @notes.text == m.notes
+        nc = @notes.caret
+        @notes.text = m.notes
+        @notes.caret = nc
+      end
       mine_status = STATUSES[@status.selected]
       if o.status != t.status && mine_status == t.status
         @status.selected = STATUSES.index(o.status) || 0
