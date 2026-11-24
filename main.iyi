@@ -236,8 +236,8 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   fail("editors gone under the search") unless app.title.attached_to?(app.root)
   fail("focus left the title field") unless win.ui.focused == app.title
 
+  # Ctrl+F selects the old query, so Backspace clears it
   ctrl(win, Key::F)
-  ctrl(win, Key::A)
   press(win, Key::Backspace)
   fail("rows after clearing the search: " + titles(app).inspect) unless titles(app).size == 4
 
@@ -295,9 +295,9 @@ def selftest(win : Window, app : App, bmp : String) : Nil
   outside(app)
   fail("append not merged: " + app.notes.text.inspect) unless app.notes.text == mine + "outside line\n"
   fail("merged notes not saved:\n" + file_of(id)) unless file_of(id).ends_with?(mine + "outside line\n")
+  fail("caret moved by the merge: " + app.notes.caret.to_s) unless app.notes.caret == mine.size
 
   # Both sides rewrote the notes: mine is saved, the outside version goes to a conflict file.
-  # (the merge set the notes anew, so the caret is at the start: compare whole texts)
   win.inject TextInput.new("again")
   mine = app.notes.text
   text = file_of(id)
